@@ -16,9 +16,19 @@ Build (on guest): `make -C <module> KDIR=/lib/modules/$(uname -r)/build`.
 Load order: `virtio_dma_buf`, `gunyah_guest`, then `virtio-gpu`.
 See host counterpart Droid-VM/gunyah_host_mod and Droid-VM/droidvm-3d-accel.
 
-## DKMS
+## Install
 
-Install as a DKMS package (auto-rebuilds on guest kernel upgrades):
+One-liner (inside the guest, installs as a DKMS package that auto-rebuilds on
+guest kernel upgrades, then refreshes the initramfs):
+
+    curl -L https://raw.githubusercontent.com/Droid-VM/droidvm-guest-additions/3d-accel-gfxstream/install.sh | sudo bash
+
+From a checkout, `sudo ./install.sh` does the same. Optional env vars:
+`DROIDVM_GA_REPO`/`DROIDVM_GA_REF` pick the source repo/branch,
+`DROIDVM_MESA_URL` additionally unpacks a `mesa-guest-aarch64.tar.gz`
+(see `6_build_guest_mesa.sh` in the meta repo) into `/`.
+
+Manual DKMS route (what install.sh automates):
 
     sudo cp -r . /usr/src/droidvm-guest-additions-1.0
     sudo dkms install droidvm-guest-additions/1.0
