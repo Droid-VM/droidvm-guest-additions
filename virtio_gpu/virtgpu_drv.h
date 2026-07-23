@@ -31,6 +31,15 @@
 #include <linux/virtio_ids.h>
 #include <linux/virtio_config.h>
 #include <linux/virtio_gpu.h>
+/*
+ * DroidVM gfxstream pre-alloc: the build uses the kernel's <linux/virtio_gpu.h> (not the
+ * vendored uapi copy), so define our map_info flag here where every .c file sees it. Set in
+ * the RESOURCE_MAP_BLOB response's map_info when the blob is GpuPool-resident; the gunyah_handle
+ * field then carries the pool byte offset instead of a memparcel handle.
+ */
+#ifndef VIRTIO_GPU_MAP_INFO_POOL
+#define VIRTIO_GPU_MAP_INFO_POOL      (1u << 31)
+#endif
 
 #include <drm/drm_atomic.h>
 #include <drm/drm_drv.h>
@@ -42,6 +51,16 @@
 #include <drm/drm_ioctl.h>
 #include <drm/drm_probe_helper.h>
 #include <drm/virtgpu_drm.h>
+
+/* DroidVM guest-alloc: crosvm's downstream virtio feature (bit 6) + getparam (10). The kernel's
+ * <linux/virtio_gpu.h> / <drm/virtgpu_drm.h> predate them, and the fork's uapi copy is shadowed by
+ * the kernel header's include guard -- so define them here (included by every driver TU). */
+#ifndef VIRTIO_GPU_F_CREATE_GUEST_HANDLE
+#define VIRTIO_GPU_F_CREATE_GUEST_HANDLE 6
+#endif
+#ifndef VIRTGPU_PARAM_CREATE_GUEST_HANDLE
+#define VIRTGPU_PARAM_CREATE_GUEST_HANDLE 10
+#endif
 
 #define DRIVER_NAME "virtio_gpu"
 #define DRIVER_DESC "virtio GPU"
@@ -113,6 +132,19 @@ struct virtio_gpu_object_vram {
 	/* Gunyah: memparcel handle the guest must accept to map this blob (0 = n/a). */
 	uint32_t gunyah_handle;
 	bool gunyah_accepted;
+	/*
+	 * DroidVM gfxstream pre-alloc: this blob is GpuPool-resident. Its pages are already in
+	 * the guest stage-2 (pool SHARE-blessed at boot), so mmap io_remaps gpu_pool_base +
+	 * pool_offset and never accepts a memparcel.
+	 */
+	bool pool_resident;
+	u64 pool_offset;
+	/*
+	 * DroidVM guest-alloc: this pool-resident blob was sub-allocated by the GUEST driver
+	 * from the gpu_guest_reserved pool (not the host). The guest built the mem-entries
+	 * (pool GPAs) itself and must return pool_offset to its own allocator on free.
+	 */
+	bool guest_pool_owned;
 	struct drm_mm_node vram_node;
 };
 
@@ -260,11 +292,28 @@ struct virtio_gpu_device {
 	bool has_resource_blob;
 	bool has_host_visible;
 	bool has_context_init;
+	/* DroidVM guest-alloc: VIRTIO_GPU_F_CREATE_GUEST_HANDLE negotiated (udmabuf=true). */
+	bool has_create_guest_handle;
 	struct virtio_shm_region host_visible_region;
 	struct drm_mm host_visible_mm;
 	/* Gunyah: permanent guard so no blob is shared at the BAR base gpa,
 	 * which the RM rejects (mem_share EINVAL at offset 0). */
 	struct drm_mm_node host_visible_guard;
+	/* DroidVM gfxstream pre-alloc: guest physical base of the boot-blessed GpuPool
+	 * (from the /reserved-memory "gpu_blob_reserved" DT node), or 0 if absent. A
+	 * pool-resident blob maps gpu_pool_base + pool_offset directly. */
+	phys_addr_t gpu_pool_base;
+
+	/* DroidVM guest-alloc: the separate boot-blessed guest-alloc pool (from the
+	 * "gpu_guest_reserved" DT node). The guest driver OWNS this region: it sub-allocates
+	 * BLOB_MEM_GUEST backing from it (page-granular bitmap) and hands the pool GPAs to the
+	 * host as ordinary mem-entries, so the official attach_iov path works in a protected VM
+	 * (the pool is host-accessible, unlike arbitrary guest RAM). Zero base = guest-alloc off. */
+	phys_addr_t gpu_guest_pool_base;
+	u64 gpu_guest_pool_size;
+	unsigned long *guest_pool_bitmap; /* one bit per PAGE_SIZE, set = allocated */
+	u64 guest_pool_npages;
+	struct mutex guest_pool_lock;
 
 	struct work_struct config_changed_work;
 
@@ -507,6 +556,16 @@ bool virtio_gpu_is_vram(struct virtio_gpu_object *bo);
 int virtio_gpu_vram_create(struct virtio_gpu_device *vgdev,
 			   struct virtio_gpu_object_params *params,
 			   struct virtio_gpu_object **bo_ptr);
+
+/* DroidVM guest-alloc pool (gpu_guest_reserved), in virtgpu_vram.c */
+int virtio_gpu_guest_pool_init(struct virtio_gpu_device *vgdev);
+void virtio_gpu_guest_pool_fini(struct virtio_gpu_device *vgdev);
+/* Reserve npages contiguous pages; returns byte offset within the pool, or -1 on OOM. */
+s64 virtio_gpu_guest_pool_alloc(struct virtio_gpu_device *vgdev, u64 npages);
+void virtio_gpu_guest_pool_free(struct virtio_gpu_device *vgdev, u64 offset, u64 npages);
+int virtio_gpu_guest_pool_create(struct virtio_gpu_device *vgdev,
+				 struct virtio_gpu_object_params *params,
+				 struct virtio_gpu_object **bo_ptr);
 struct sg_table *virtio_gpu_vram_map_dma_buf(struct virtio_gpu_object *bo,
 					     struct device *dev,
 					     enum dma_data_direction dir);

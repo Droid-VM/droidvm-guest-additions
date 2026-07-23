@@ -31,7 +31,38 @@
 #include <drm/drm_managed.h>
 #include <drm/drm_print.h>
 
+#include <linux/of.h>
+#include <linux/of_address.h>
+
 #include "virtgpu_drv.h"
+
+/*
+ * DroidVM gfxstream pre-alloc: find the boot-blessed GpuPool base GPA from the
+ * /reserved-memory "gpu_blob_reserved@<gpa>" node crosvm emits (no-map, matched by the
+ * Gunyah RM to the SHARE'd pool region). Returns 0 if not present (pre-alloc off).
+ */
+static phys_addr_t virtio_gpu_find_pool_base(void)
+{
+	struct device_node *rmem, *child;
+	phys_addr_t base = 0;
+
+	rmem = of_find_node_by_path("/reserved-memory");
+	if (!rmem)
+		return 0;
+	for_each_child_of_node(rmem, child) {
+		struct resource res;
+
+		if (!of_node_name_prefix(child, "gpu_blob_reserved"))
+			continue;
+		if (of_address_to_resource(child, 0, &res) == 0) {
+			base = res.start;
+			of_node_put(child);
+			break;
+		}
+	}
+	of_node_put(rmem);
+	return base;
+}
 
 static void virtio_gpu_config_changed_work_func(struct work_struct *work)
 {
@@ -214,6 +245,22 @@ int virtio_gpu_init(struct virtio_device *vdev, struct drm_device *dev)
 	if (virtio_has_feature(vgdev->vdev, VIRTIO_GPU_F_CONTEXT_INIT))
 		vgdev->has_context_init = true;
 
+	if (virtio_has_feature(vgdev->vdev, VIRTIO_GPU_F_CREATE_GUEST_HANDLE))
+		vgdev->has_create_guest_handle = true;
+	pr_info("virtio-gpu: has_create_guest_handle=%d\n",
+		vgdev->has_create_guest_handle);
+
+	vgdev->gpu_pool_base = virtio_gpu_find_pool_base();
+	if (vgdev->gpu_pool_base)
+		DRM_INFO("gfxstream pre-alloc: GpuPool base %pa\n",
+			 &vgdev->gpu_pool_base);
+
+	/* DroidVM guest-alloc: bring up the guest-owned pool allocator (gpu_guest_reserved),
+	 * if present. Absent => guest-alloc off (host-alloc / upstream shmem paths only). */
+	ret = virtio_gpu_guest_pool_init(vgdev);
+	if (ret)
+		DRM_WARN("guest-alloc pool init failed: %d (guest-alloc disabled)\n", ret);
+
 	DRM_INFO("features: %cvirgl %cedid %cresource_blob %chost_visible",
 		 vgdev->has_virgl_3d    ? '+' : '-',
 		 vgdev->has_edid        ? '+' : '-',
@@ -273,6 +320,7 @@ int virtio_gpu_init(struct virtio_device *vdev, struct drm_device *dev)
 		wait_event_timeout(vgdev->resp_wq, !vgdev->display_info_pending,
 				   5 * HZ);
 	}
+
 	return 0;
 
 err_scanouts:
@@ -316,6 +364,7 @@ void virtio_gpu_release(struct drm_device *dev)
 	virtio_gpu_modeset_fini(vgdev);
 	virtio_gpu_free_vbufs(vgdev);
 	virtio_gpu_cleanup_cap_cache(vgdev);
+	virtio_gpu_guest_pool_fini(vgdev);
 
 	if (vgdev->has_host_visible) {
 		if (drm_mm_node_allocated(&vgdev->host_visible_guard))

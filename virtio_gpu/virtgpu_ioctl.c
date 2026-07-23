@@ -38,6 +38,12 @@
 				    VIRTGPU_BLOB_FLAG_USE_SHAREABLE | \
 				    VIRTGPU_BLOB_FLAG_USE_CROSS_DEVICE)
 
+/* DroidVM guest-alloc: mesa sets this on a BLOB_MEM_GUEST allocation once
+ * VIRTIO_GPU_F_CREATE_GUEST_HANDLE is negotiated. The guest kernel routes on
+ * blob_mem==GUEST (see the guest_blob branch below), so this bit is only a
+ * marker that verify_blob must accept rather than reject as an unknown flag. */
+#define VIRTGPU_BLOB_FLAG_CREATE_GUEST_HANDLE 0x0008
+
 /* Must be called with &virtio_gpu_fpriv.struct_mutex held. */
 static void virtio_gpu_create_context_locked(struct virtio_gpu_device *vgdev,
 					     struct virtio_gpu_fpriv *vfpriv)
@@ -116,6 +122,11 @@ static int virtio_gpu_getparam_ioctl(struct drm_device *dev, void *data,
 		break;
 	case VIRTGPU_PARAM_EXPLICIT_DEBUG_NAME:
 		value = vgdev->has_context_init ? 1 : 0;
+		break;
+	/* DroidVM guest-alloc: mesa reads this (param 10, defined in virtgpu_drv.h) to pick the
+	 * guest-alloc path. Set only when VIRTIO_GPU_F_CREATE_GUEST_HANDLE was negotiated. */
+	case VIRTGPU_PARAM_CREATE_GUEST_HANDLE:
+		value = vgdev->has_create_guest_handle ? 1 : 0;
 		break;
 	default:
 		return -EINVAL;
@@ -445,7 +456,8 @@ static int verify_blob(struct virtio_gpu_device *vgdev,
 	if (!vgdev->has_resource_blob)
 		return -EINVAL;
 
-	if (rc_blob->blob_flags & ~VIRTGPU_BLOB_FLAG_USE_MASK)
+	if (rc_blob->blob_flags &
+	    ~(VIRTGPU_BLOB_FLAG_USE_MASK | VIRTGPU_BLOB_FLAG_CREATE_GUEST_HANDLE))
 		return -EINVAL;
 
 	if (rc_blob->blob_flags & VIRTGPU_BLOB_FLAG_USE_CROSS_DEVICE) {
@@ -478,11 +490,26 @@ static int verify_blob(struct virtio_gpu_device *vgdev,
 		params->ctx_id = vfpriv->ctx_id;
 		params->blob_id = rc_blob->blob_id;
 	} else {
-		if (rc_blob->blob_id != 0)
+		/* DroidVM guest-alloc (CREATE_GUEST_HANDLE): unlike a spec
+		 * BLOB_MEM_GUEST blob (no ctx/blob_id), gfxstream correlates the guest
+		 * pages with the host-visible VkDeviceMemory the owning context already
+		 * allocated, so the CREATE_BLOB command must carry BOTH mesa's ctx_id and
+		 * blob_id (the pages are still supplied via ents). Without them the host
+		 * createBlob fails "context-0-missing". Non-guest-alloc guest blobs keep
+		 * the spec rule that blob_id must be 0. */
+		bool guest_alloc =
+			rc_blob->blob_flags & VIRTGPU_BLOB_FLAG_CREATE_GUEST_HANDLE;
+
+		if (rc_blob->blob_id != 0 && !guest_alloc)
 			return -EINVAL;
 
 		if (rc_blob->cmd_size != 0)
 			return -EINVAL;
+
+		if (guest_alloc) {
+			params->ctx_id = vfpriv->ctx_id;
+			params->blob_id = rc_blob->blob_id;
+		}
 	}
 
 	params->blob_mem = rc_blob->blob_mem;
@@ -539,12 +566,30 @@ static int virtio_gpu_resource_create_blob_ioctl(struct drm_device *dev,
 				      vfpriv->ctx_id, NULL, NULL);
 	}
 
-	if (guest_blob)
-		ret = virtio_gpu_object_create(vgdev, &params, &bo, NULL);
-	else if (!guest_blob && host3d_blob)
+	if (guest_blob) {
+		/*
+		 * DroidVM guest-alloc: when the guest-alloc pool is present (gfx-guest-mb set),
+		 * back BLOB_MEM_GUEST from it (pages the host can resolve via attach_iov in a
+		 * protected VM) instead of arbitrary shmem RAM (unreachable by the host in pVM).
+		 */
+		pr_info("VGBLOB-ROUTE: guest_blob mem=%u flags=0x%x size=%llu guest_pool=%d\n",
+			rc_blob->blob_mem, rc_blob->blob_flags,
+			(unsigned long long)rc_blob->size,
+			vgdev->gpu_guest_pool_base ? 1 : 0);
+		if (vgdev->gpu_guest_pool_base)
+			ret = virtio_gpu_guest_pool_create(vgdev, &params, &bo);
+		else
+			ret = virtio_gpu_object_create(vgdev, &params, &bo, NULL);
+	} else if (!guest_blob && host3d_blob) {
 		ret = virtio_gpu_vram_create(vgdev, &params, &bo);
-	else
+		pr_info("VGBLOB-BAR: comm=%s pid=%d res=%u size=%llu flags=0x%x mappable=%d\n",
+			current->comm, current->pid,
+			ret == 0 ? bo->hw_res_handle : 0,
+			(unsigned long long)rc_blob->size, rc_blob->blob_flags,
+			!!(rc_blob->blob_flags & VIRTGPU_BLOB_FLAG_USE_MAPPABLE));
+	} else {
 		return -EINVAL;
+	}
 
 	if (ret < 0) {
 		pr_err("VGBLOB-DBG: create FAILED ret=%d (%s) mem=%u flags=0x%x size=%llu\n",

@@ -163,6 +163,8 @@ static unsigned int features[] = {
 	VIRTIO_GPU_F_RESOURCE_UUID,
 	VIRTIO_GPU_F_RESOURCE_BLOB,
 	VIRTIO_GPU_F_CONTEXT_INIT,
+	/* DroidVM guest-alloc: negotiated only when crosvm offers it (--gpu udmabuf=true). */
+	VIRTIO_GPU_F_CREATE_GUEST_HANDLE,
 };
 static struct virtio_driver virtio_gpu_driver = {
 	.feature_table = features,

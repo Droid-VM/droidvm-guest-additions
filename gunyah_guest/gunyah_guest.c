@@ -145,6 +145,20 @@ int gunyah_guest_mem_accept(u32 handle, u64 gpa, u64 size)
 	put_unaligned_le32(handle, p + off); off += 4;
 	p[off++] = GH_RM_MEM_TYPE_NORMAL;
 	p[off++] = GH_RM_TRANS_TYPE_SHARE;
+	/*
+	 * MAP_IPA_CONTIGUOUS + a SINGLE sgl {gpa, size} is the correct form for a
+	 * scatter-gather blob. A >2MB blob is backed by several independent, non-
+	 * adjacent 2MB folios, so the memparcel carries N mem_entries (one per
+	 * physically-contiguous run). The RM's accept has exactly two shapes
+	 * (rsc-mgr memparcel_do_accept): num_mappings = contiguous ? 1 : N. With the
+	 * flag OFF the guest must supply N sgl entries, each sized to a region -- a
+	 * layout the guest cannot know. With the flag ON, num_mappings=1: the guest
+	 * gives ONE sgl {gpa, total_size} (total_size must equal mp->total_size, i.e.
+	 * the exact page-aligned byte count the host share_blob()'d = obj->size) and
+	 * the RM allocates one contiguous IPA range and lays the N scattered
+	 * mem_entries into it sequentially -- IPA contiguous, PA scattered. A single
+	 * sgl WITHOUT the flag gave err_code=0x6 (ARGUMENT_INVALID: 1 != N mappings).
+	 */
 	p[off++] = GH_RM_MEM_ACCEPT_MAP_IPA_CONTIGUOUS | GH_RM_MEM_ACCEPT_DONE;
 	p[off++] = 0;						/* reserved1 */
 	put_unaligned_le32(0, p + off); off += 4;		/* validate_label */
