@@ -5,7 +5,9 @@ KDIR ?= /lib/modules/$(shell uname -r)/build
 all:
 	$(MAKE) -C gunyah_guest KDIR=$(KDIR)
 	$(MAKE) -C virtio_gpu KDIR=$(KDIR)
+	$(MAKE) -C virtio_gunyah_accept KDIR=$(KDIR)
 
 clean:
 	$(MAKE) -C gunyah_guest clean KDIR=$(KDIR)
 	$(MAKE) -C virtio_gpu clean KDIR=$(KDIR)
+	$(MAKE) -C virtio_gunyah_accept clean KDIR=$(KDIR)
