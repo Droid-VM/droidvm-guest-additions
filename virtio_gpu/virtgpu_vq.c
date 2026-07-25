@@ -1378,18 +1378,14 @@ static void virtio_gpu_cmd_resource_map_cb(struct virtio_gpu_device *vgdev,
 		if (mi & VIRTIO_GPU_MAP_INFO_POOL) {
 			/*
 			 * DroidVM gfxstream pre-alloc: the host sub-allocated this blob from the
-			 * boot-blessed GpuPool. The gunyah_handle field carries the pool BYTE
-			 * OFFSET, not a memparcel handle -- map gpu_pool_base + offset directly,
-			 * never accept (leave gunyah_handle 0 so the mmap accept branch is skipped).
+			 * boot-blessed GpuPool, and the spec's padding field carries the pool BYTE
+			 * OFFSET -- map gpu_pool_base + offset directly.
 			 */
 			vram->pool_resident = true;
 			vram->pool_offset = le32_to_cpu(resp->padding);
-			vram->gunyah_handle = 0;
 			vram->map_info = mi & VIRTIO_GPU_MAP_CACHE_MASK;
 		} else {
 			vram->map_info = mi;
-			/* Gunyah: handle to accept later (in the sleepable mmap path). */
-			vram->gunyah_handle = le32_to_cpu(resp->padding);
 		}
 		vram->map_state = STATE_OK;
 	} else {

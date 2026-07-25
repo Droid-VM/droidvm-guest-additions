@@ -34,8 +34,8 @@
 /*
  * DroidVM gfxstream pre-alloc: the build uses the kernel's <linux/virtio_gpu.h> (not the
  * vendored uapi copy), so define our map_info flag here where every .c file sees it. Set in
- * the RESOURCE_MAP_BLOB response's map_info when the blob is GpuPool-resident; the gunyah_handle
- * field then carries the pool byte offset instead of a memparcel handle.
+ * the RESOURCE_MAP_BLOB response's map_info when the blob is GpuPool-resident; the response's
+ * padding field then carries the pool byte offset.
  */
 #ifndef VIRTIO_GPU_MAP_INFO_POOL
 #define VIRTIO_GPU_MAP_INFO_POOL      (1u << 31)
@@ -129,13 +129,10 @@ struct virtio_gpu_object_vram {
 	struct virtio_gpu_object base;
 	uint32_t map_state;
 	uint32_t map_info;
-	/* Gunyah: memparcel handle the guest must accept to map this blob (0 = n/a). */
-	uint32_t gunyah_handle;
-	bool gunyah_accepted;
 	/*
 	 * DroidVM gfxstream pre-alloc: this blob is GpuPool-resident. Its pages are already in
 	 * the guest stage-2 (pool SHARE-blessed at boot), so mmap io_remaps gpu_pool_base +
-	 * pool_offset and never accepts a memparcel.
+	 * pool_offset with no runtime SHARE at all.
 	 */
 	bool pool_resident;
 	u64 pool_offset;

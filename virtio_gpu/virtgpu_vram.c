@@ -3,7 +3,6 @@
 
 #include <linux/bitmap.h>
 #include <linux/dma-mapping.h>
-#include <linux/gunyah_guest.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/sizes.h>
@@ -21,19 +20,11 @@ static void virtio_gpu_vram_free(struct drm_gem_object *obj)
 		spin_unlock(&vgdev->host_visible_lock);
 
 		/*
-		 * Gunyah: release our stage-2 acceptance BEFORE telling the host to
-		 * unmap. virtio_gpu_cmd_unmap's host response frees vram_node via
-		 * drm_mm_remove_node, handing this BAR offset to the next blob; if the
-		 * memparcel is still accepted at that point, the host re-SHAREs the
-		 * reused GPA while the guest stage-2 still maps it and RM rejects it
-		 * with EINVAL (intermittent RESOURCE_MAP_BLOB failures at offset 0).
-		 * Releasing first closes that race.
+		 * Gunyah acceptance (and its release-before-unmap ordering, which keeps the
+		 * host from re-SHAREing a reused BAR offset while the guest still maps it)
+		 * is driven host-side over the virtio-gunyah-accept transport, inside the
+		 * unmap below. Nothing to do here.
 		 */
-		if (vram->gunyah_accepted) {
-			gunyah_guest_mem_release(vram->gunyah_handle);
-			vram->gunyah_accepted = false;
-		}
-
 		if (unmap)
 			virtio_gpu_cmd_unmap(vgdev, bo);
 
@@ -81,48 +72,12 @@ static int virtio_gpu_vram_mmap(struct drm_gem_object *obj,
 	}
 
 	/*
-	 * Gunyah: the host SHARE'd this blob but cannot push the mapping into a
-	 * protected guest's stage-2. Accept the memparcel here (sleepable context)
-	 * so the IPA at vram_node.start becomes accessible before io_remap.
-	 *
-	 * gfxstream pre-alloc (pool_resident): nothing to accept -- the GpuPool was
-	 * SHARE-blessed at boot, so gpu_pool_base + pool_offset is already mapped.
+	 * Gunyah: the host SHARE'd this blob and drove the guest-side memparcel accept
+	 * itself, over the virtio-gunyah-accept transport, before the map_blob response
+	 * came back -- so the IPA at vram_node.start is already accessible here and this
+	 * driver needs no memparcel code at all. (gfxstream pre-alloc blobs never even
+	 * SHARE: the pool was blessed at boot.)
 	 */
-	if (!vram->pool_resident && vram->gunyah_handle && !vram->gunyah_accepted) {
-		/*
-		 * Accept the whole blob in ONE call with MAP_IPA_CONTIGUOUS. The host
-		 * SHARE'd it as a memparcel with one mem_entry per physically-contiguous
-		 * run -- a >2MB blob backed by independent 2MB folios (from
-		 * gh_hugepage_reserve's alloc_pages) therefore has N (>1) mem_entries.
-		 * The rsc-mgr accept has exactly two shapes (memparcel_do_accept:
-		 * num_mappings = contiguous ? 1 : N). We use the contiguous shape: a
-		 * single sgl {gpa, obj->size} where obj->size must equal mp->total_size
-		 * (the exact page-aligned bytes the host share_blob()'d). The RM then
-		 * allocates one contiguous IPA range at vram_node.start and lays the N
-		 * scattered mem_entries into it sequentially -- IPA contiguous, PA
-		 * scattered, exactly what a BAR-mapped scatter-gather blob needs.
-		 *
-		 * History: the per-2MB chunking (a128002) sent one accept per 2MB; and a
-		 * single non-contiguous sgl {gpa,size} both fail err_code=0x6
-		 * (ARGUMENT_INVALID) -- the non-contiguous path needs N sgl entries, one
-		 * sized to each region, which the guest cannot know. MAP_IPA_CONTIGUOUS
-		 * collapses that to num_mappings=1. The 2MB BAR alignment
-		 * (drm_mm_insert_node_generic) is kept so each blob owns whole folios and
-		 * never collides with a neighbour's stage-2 mapping.
-		 *
-		 * Size: obj->size (page-aligned actual size), NOT the 2MB-padded
-		 * vram_node.size -- the host's share_blob() only SHAREs the actual size,
-		 * so only obj->size matches mp->total_size.
-		 */
-		ret = gunyah_guest_mem_accept(vram->gunyah_handle,
-					      vram->vram_node.start, obj->size);
-		if (ret) {
-			pr_err("virtio-gpu: gunyah accept failed for blob handle 0x%x: %d\n",
-			       vram->gunyah_handle, ret);
-			return ret;
-		}
-		vram->gunyah_accepted = true;
-	}
 
 	vma->vm_pgoff -= drm_vma_node_start(&obj->vma_node);
 	vm_flags_set(vma, VM_MIXEDMAP | VM_DONTEXPAND);
