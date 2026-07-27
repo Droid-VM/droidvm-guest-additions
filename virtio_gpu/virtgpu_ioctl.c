@@ -128,6 +128,23 @@ static int virtio_gpu_getparam_ioctl(struct drm_device *dev, void *data,
 	case VIRTGPU_PARAM_CREATE_GUEST_HANDLE:
 		value = vgdev->has_create_guest_handle ? 1 : 0;
 		break;
+	/* DroidVM guest-alloc pool accounting -- see virtgpu_drv.h. Reported in KiB because this
+	 * ioctl writes an int; a byte count would overflow at 2 GiB. Zero when there is no pool,
+	 * which is also how a caller detects that this kernel has no guest-alloc pool at all. */
+	case VIRTGPU_PARAM_GUEST_POOL_TOTAL_KIB:
+	case VIRTGPU_PARAM_GUEST_POOL_USED_KIB:
+	case VIRTGPU_PARAM_GUEST_POOL_LARGEST_FREE_KIB: {
+		u64 total, used, largest;
+
+		virtio_gpu_guest_pool_stats(vgdev, &total, &used, &largest);
+		if (param->param == VIRTGPU_PARAM_GUEST_POOL_TOTAL_KIB)
+			value = (int)(total >> 10);
+		else if (param->param == VIRTGPU_PARAM_GUEST_POOL_USED_KIB)
+			value = (int)(used >> 10);
+		else
+			value = (int)(largest >> 10);
+		break;
+	}
 	default:
 		return -EINVAL;
 	}

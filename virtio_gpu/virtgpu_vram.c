@@ -34,12 +34,11 @@ static void virtio_gpu_vram_free(struct drm_gem_object *obj)
 		/*
 		 * DroidVM guest-alloc: this blob's backing was sub-allocated by us from the
 		 * guest-alloc pool. The host has now dropped its reference (unref above), so
-		 * return the pages to our bitmap. (Host-alloc pool_resident blobs are freed
+		 * return the blocks to the allocator. (Host-alloc pool_resident blobs are freed
 		 * host-side and never set guest_pool_owned.)
 		 */
 		if (vram->guest_pool_owned)
-			virtio_gpu_guest_pool_free(vgdev, vram->pool_offset,
-						   PFN_UP(obj->size));
+			virtio_gpu_guest_pool_free(vgdev, &vram->guest_pool_blocks);
 		return;
 	}
 }
@@ -97,26 +96,72 @@ static int virtio_gpu_vram_mmap(struct drm_gem_object *obj,
 		return -EINVAL;
 
 	/*
-	 * gfxstream pre-alloc: remap the GpuPool page (gpu_pool_base + pool_offset)
-	 * instead of the BAR node. The pool is already in the guest stage-2, so no
-	 * accept was needed. (3b will io_remap a run list for fragmented blobs.)
+	 * guest-alloc: the backing is a list of pool blocks, so stitch them into one contiguous
+	 * user mapping -- block order is the order they were allocated in, which is also the order
+	 * the mem-entries went to the host, so offset N in this mapping is offset N there too.
+	 *
+	 * vm_pgoff is an offset into the object (a partial mmap), so walk past whole blocks that
+	 * fall before it and start part-way into the one that straddles it.
 	 */
-	if (vram->pool_resident) {
-		phys_addr_t base, pa;
+	if (vram->guest_pool_owned) {
+		unsigned long uaddr = vma->vm_start;
+		u64 skip = (u64)vma->vm_pgoff << PAGE_SHIFT;
+		struct drm_buddy_block *block;
 
-		/*
-		 * DroidVM guest-alloc blobs live in the guest-alloc pool (gpu_guest_pool_base),
-		 * which the guest driver owns; host-alloc pool_resident blobs live in the
-		 * host pool (gpu_pool_base).
-		 */
-		base = vram->guest_pool_owned ? vgdev->gpu_guest_pool_base
-					      : vgdev->gpu_pool_base;
-		if (!base) {
-			pr_err("virtio-gpu: pool-resident blob but no pool base in DT (guest=%d)\n",
-			       vram->guest_pool_owned);
+		if (!vgdev->gpu_guest_pool_base) {
+			pr_err("virtio-gpu: guest-alloc blob but no gpu_guest_reserved base in DT\n");
 			return -EINVAL;
 		}
-		pa = base + vram->pool_offset;
+
+		list_for_each_entry(block, &vram->guest_pool_blocks, link) {
+			u64 off = drm_buddy_block_offset(block);
+			u64 len = drm_buddy_block_size(&vgdev->guest_pool_mm, block);
+			phys_addr_t pa;
+
+			if (skip >= len) {
+				skip -= len;
+				continue;
+			}
+			off += skip;
+			len -= skip;
+			skip = 0;
+
+			if (len > (u64)(vma->vm_end - uaddr))
+				len = vma->vm_end - uaddr;
+			if (!len)
+				break;
+
+			pa = vgdev->gpu_guest_pool_base + off;
+			ret = io_remap_pfn_range(vma, uaddr, pa >> PAGE_SHIFT, len,
+						 vma->vm_page_prot);
+			if (ret)
+				return ret;
+
+			uaddr += len;
+			if (uaddr >= vma->vm_end)
+				break;
+		}
+		if (uaddr < vma->vm_end) {
+			pr_err("virtio-gpu: guest-alloc mmap short by %lu bytes\n",
+			       vma->vm_end - uaddr);
+			return -EINVAL;
+		}
+		return 0;
+	}
+
+	/*
+	 * gfxstream pre-alloc (host pool): still one run, so remap gpu_pool_base + pool_offset
+	 * instead of the BAR node. The pool is already in the guest stage-2, so no accept was
+	 * needed.
+	 */
+	if (vram->pool_resident) {
+		phys_addr_t pa;
+
+		if (!vgdev->gpu_pool_base) {
+			pr_err("virtio-gpu: pool-resident blob but no pool base in DT\n");
+			return -EINVAL;
+		}
+		pa = vgdev->gpu_pool_base + vram->pool_offset;
 		return io_remap_pfn_range(vma, vma->vm_start,
 					  (pa >> PAGE_SHIFT) + vma->vm_pgoff,
 					  vm_size, vma->vm_page_prot);
@@ -327,6 +372,7 @@ int virtio_gpu_guest_pool_init(struct virtio_gpu_device *vgdev)
 	struct resource res;
 	phys_addr_t base = 0;
 	u64 size = 0;
+	int ret;
 
 	rmem = of_find_node_by_path("/reserved-memory");
 	if (!rmem)
@@ -346,60 +392,94 @@ int virtio_gpu_guest_pool_init(struct virtio_gpu_device *vgdev)
 	if (!base || !size)
 		return 0; /* guest-alloc pool absent -> feature off */
 
+	/* drm_buddy wants a chunk-aligned size; trim rather than round up, the tail is not ours. */
+	size = ALIGN_DOWN(size, PAGE_SIZE);
+	if (!size)
+		return 0;
+
 	mutex_init(&vgdev->guest_pool_lock);
-	vgdev->guest_pool_npages = size >> PAGE_SHIFT;
-	vgdev->guest_pool_bitmap = bitmap_zalloc(vgdev->guest_pool_npages,
-						 GFP_KERNEL);
-	if (!vgdev->guest_pool_bitmap)
-		return -ENOMEM;
+	ret = drm_buddy_init(&vgdev->guest_pool_mm, size, PAGE_SIZE);
+	if (ret) {
+		pr_err("virtio-gpu: guest-alloc pool: drm_buddy_init failed %d\n", ret);
+		return ret;
+	}
+	vgdev->guest_pool_ready = true;
 
 	vgdev->gpu_guest_pool_base = base;
 	vgdev->gpu_guest_pool_size = size;
-	pr_info("virtio-gpu: guest-alloc pool: base %pa size %llu MiB (%llu pages)\n",
+	pr_info("virtio-gpu: guest-alloc pool: base %pa size %llu MiB (drm_buddy, %u roots, max order %u)\n",
 		&vgdev->gpu_guest_pool_base, size >> 20,
-		vgdev->guest_pool_npages);
+		vgdev->guest_pool_mm.n_roots, vgdev->guest_pool_mm.max_order);
 	return 0;
 }
 
 void virtio_gpu_guest_pool_fini(struct virtio_gpu_device *vgdev)
 {
-	if (vgdev->guest_pool_bitmap) {
-		bitmap_free(vgdev->guest_pool_bitmap);
-		vgdev->guest_pool_bitmap = NULL;
+	if (vgdev->guest_pool_ready) {
+		vgdev->guest_pool_ready = false;
+		drm_buddy_fini(&vgdev->guest_pool_mm);
 	}
 }
 
-s64 virtio_gpu_guest_pool_alloc(struct virtio_gpu_device *vgdev, u64 npages)
+/* Carve `size` bytes out of the pool as a list of blocks.
+ *
+ * No contiguity is asked for: the caller sends one mem-entry per block and stitches them back
+ * together in user VA at mmap time, so a fragmented pool is still a usable one. Callers that
+ * genuinely need one physical run (scanout) would pass DRM_BUDDY_CONTIGUOUS_ALLOCATION; none do
+ * today.
+ */
+int virtio_gpu_guest_pool_alloc(struct virtio_gpu_device *vgdev, u64 size,
+				struct list_head *blocks)
 {
-	unsigned long start;
+	int ret;
 
-	if (!vgdev->guest_pool_bitmap || !npages)
-		return -1;
+	INIT_LIST_HEAD(blocks);
+	if (!vgdev->guest_pool_ready || !size)
+		return -ENOMEM;
+
+	size = ALIGN(size, PAGE_SIZE);
 
 	mutex_lock(&vgdev->guest_pool_lock);
-	start = bitmap_find_next_zero_area(vgdev->guest_pool_bitmap,
-					   vgdev->guest_pool_npages, 0,
-					   npages, 0);
-	if (start >= vgdev->guest_pool_npages) {
-		mutex_unlock(&vgdev->guest_pool_lock);
-		return -1; /* pool exhausted (or too fragmented for a single run) */
-	}
-	bitmap_set(vgdev->guest_pool_bitmap, start, npages);
+	ret = drm_buddy_alloc_blocks(&vgdev->guest_pool_mm, 0,
+				     vgdev->guest_pool_mm.size, size, PAGE_SIZE,
+				     blocks, 0);
 	mutex_unlock(&vgdev->guest_pool_lock);
 
-	return (s64)start << PAGE_SHIFT;
+	return ret;
 }
 
-void virtio_gpu_guest_pool_free(struct virtio_gpu_device *vgdev, u64 offset,
-				u64 npages)
+void virtio_gpu_guest_pool_free(struct virtio_gpu_device *vgdev, struct list_head *blocks)
 {
-	unsigned long start = offset >> PAGE_SHIFT;
-
-	if (!vgdev->guest_pool_bitmap || !npages)
+	if (!vgdev->guest_pool_ready || list_empty(blocks))
 		return;
 
 	mutex_lock(&vgdev->guest_pool_lock);
-	bitmap_clear(vgdev->guest_pool_bitmap, start, npages);
+	drm_buddy_free_list(&vgdev->guest_pool_mm, blocks, 0);
+	mutex_unlock(&vgdev->guest_pool_lock);
+}
+
+/* Pool occupancy, for the VK_EXT_memory_budget figures the guest ICD reports.
+ *
+ * largest_free is "the largest allocation that can succeed", which under drm_buddy is simply the
+ * free total: an allocation is a list of blocks, so any chunk-aligned size that fits at all fits.
+ * It is reported separately anyway because that equality is a property of this allocator, not of
+ * the interface -- the page bitmap this replaced could not satisfy a request larger than its
+ * biggest contiguous run, and a caller should not have to know which one is underneath.
+ */
+void virtio_gpu_guest_pool_stats(struct virtio_gpu_device *vgdev, u64 *total_bytes,
+				 u64 *used_bytes, u64 *largest_free_bytes)
+{
+	*total_bytes = 0;
+	*used_bytes = 0;
+	*largest_free_bytes = 0;
+
+	if (!vgdev->guest_pool_ready)
+		return;
+
+	mutex_lock(&vgdev->guest_pool_lock);
+	*total_bytes = vgdev->guest_pool_mm.size;
+	*used_bytes = vgdev->guest_pool_mm.size - vgdev->guest_pool_mm.avail;
+	*largest_free_bytes = vgdev->guest_pool_mm.avail;
 	mutex_unlock(&vgdev->guest_pool_lock);
 }
 
@@ -409,18 +489,22 @@ int virtio_gpu_guest_pool_create(struct virtio_gpu_device *vgdev,
 {
 	struct virtio_gpu_object_vram *vram;
 	struct virtio_gpu_mem_entry *ents;
+	struct drm_buddy_block *block;
 	struct drm_gem_object *obj;
-	u64 npages;
-	s64 offset;
+	struct list_head blocks;
+	u32 nents = 0, i = 0;
 	int ret;
 
 	params->size = PAGE_ALIGN(params->size);
-	npages = params->size >> PAGE_SHIFT;
 
-	offset = virtio_gpu_guest_pool_alloc(vgdev, npages);
-	if (offset < 0) {
-		pr_err("VGBLOB-DBG: guest-alloc pool OOM size=%llu (npages=%llu)\n",
-		       (unsigned long long)params->size, npages);
+	ret = virtio_gpu_guest_pool_alloc(vgdev, params->size, &blocks);
+	if (ret) {
+		u64 total, used, largest;
+
+		virtio_gpu_guest_pool_stats(vgdev, &total, &used, &largest);
+		pr_err("VGBLOB-DBG: guest-alloc pool OOM size=%llu (pool %llu MiB, used %llu MiB, largest %llu MiB)\n",
+		       (unsigned long long)params->size, total >> 20, used >> 20,
+		       largest >> 20);
 		return -ENOMEM;
 	}
 
@@ -429,6 +513,8 @@ int virtio_gpu_guest_pool_create(struct virtio_gpu_device *vgdev,
 		ret = -ENOMEM;
 		goto err_pool;
 	}
+	INIT_LIST_HEAD(&vram->guest_pool_blocks);
+	list_splice_init(&blocks, &vram->guest_pool_blocks);
 
 	obj = &vram->base.base.base;
 	obj->funcs = &virtio_gpu_vram_funcs;
@@ -445,22 +531,37 @@ int virtio_gpu_guest_pool_create(struct virtio_gpu_device *vgdev,
 		goto err_obj;
 
 	/*
-	 * Single contiguous mem-entry pointing into the guest-alloc pool. The host
-	 * resolves it via get_slice_at_addr (the GpuPoolGuest region is host-accessible),
-	 * i.e. the ordinary attach_iov path -- no host-side pool allocator involved.
+	 * One mem-entry per pool block. The host resolves each via get_slice_at_addr (the
+	 * GpuPoolGuest region is host-accessible), i.e. the ordinary attach_iov path -- no
+	 * host-side pool allocator involved, and crosvm already builds its udmabuf from however
+	 * many segments arrive. kvmalloc because a badly fragmented pool can make this list long
+	 * enough to matter, even though the buddy structure keeps it near log2 in practice.
 	 */
-	ents = kmalloc(sizeof(*ents), GFP_KERNEL);
+	list_for_each_entry(block, &vram->guest_pool_blocks, link)
+		nents++;
+
+	if (nents > 1 && !vgdev->guest_pool_multiblock_seen) {
+		vgdev->guest_pool_multiblock_seen = true;
+		pr_info("virtio-gpu: guest-alloc: scatter allocation in use (%u blocks for %lu bytes)\n",
+			nents, params->size);
+	}
+
+	ents = kvmalloc_array(nents, sizeof(*ents), GFP_KERNEL);
 	if (!ents) {
 		ret = -ENOMEM;
 		goto err_obj;
 	}
-	ents[0].addr = cpu_to_le64(vgdev->gpu_guest_pool_base + (u64)offset);
-	ents[0].length = cpu_to_le32(params->size);
-	ents[0].padding = 0;
+	list_for_each_entry(block, &vram->guest_pool_blocks, link) {
+		ents[i].addr = cpu_to_le64(vgdev->gpu_guest_pool_base +
+					   drm_buddy_block_offset(block));
+		ents[i].length = cpu_to_le32(drm_buddy_block_size(&vgdev->guest_pool_mm,
+								 block));
+		ents[i].padding = 0;
+		i++;
+	}
 
 	vram->pool_resident = true;
 	vram->guest_pool_owned = true;
-	vram->pool_offset = (u64)offset;
 	/*
 	 * The gfx-guest pool is SHARE'd (not lent) Normal-cacheable RAM in stage-2, so the guest
 	 * may map it cacheable. WC read-back is very slow and zink/mutter read host-visible buffers,
@@ -472,7 +573,7 @@ int virtio_gpu_guest_pool_create(struct virtio_gpu_device *vgdev,
 	vram->map_info = VIRTIO_GPU_MAP_CACHE_CACHED;
 	vram->vram_node.size = params->size;      /* mmap bounds check only (no drm_mm insert) */
 
-	virtio_gpu_cmd_resource_create_blob(vgdev, &vram->base, params, ents, 1);
+	virtio_gpu_cmd_resource_create_blob(vgdev, &vram->base, params, ents, nents);
 	virtio_gpu_notify(vgdev);
 
 	*bo_ptr = &vram->base;
@@ -481,9 +582,11 @@ int virtio_gpu_guest_pool_create(struct virtio_gpu_device *vgdev,
 err_obj:
 	/* Mirror virtio_gpu_vram_create's teardown (the resource id, if taken, leaks the
 	 * same way it does there -- resource_id_put is file-local to virtgpu_object.c). */
+	virtio_gpu_guest_pool_free(vgdev, &vram->guest_pool_blocks);
 	drm_gem_object_release(obj);
 	kfree(vram);
+	return ret;
 err_pool:
-	virtio_gpu_guest_pool_free(vgdev, (u64)offset, npages);
+	virtio_gpu_guest_pool_free(vgdev, &blocks);
 	return ret;
 }
