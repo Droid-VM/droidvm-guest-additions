@@ -41,7 +41,17 @@
  * /reserved-memory "gpu_blob_reserved@<gpa>" node crosvm emits (no-map, matched by the
  * Gunyah RM to the SHARE'd pool region). Returns 0 if not present (pre-alloc off).
  */
-static phys_addr_t virtio_gpu_find_pool_base(void)
+/*
+ * The host-owned pool a pool-resident blob's map_blob offset is relative to.
+ *
+ * Two hosts emit one: gfxstream's host-visible pool as "gpu_blob_reserved", and
+ * virglrenderer's KGSL native-context arena as "kgsl_reserved". A VM runs one
+ * renderer or the other, so at most one is present and the guest does not need
+ * to know which it got -- VIRTIO_GPU_MAP_INFO_POOL means "gpu_pool_base + the
+ * offset in this response" either way. gpu_blob_reserved is checked first so a
+ * host that somehow emitted both keeps the gfxstream meaning.
+ */
+static phys_addr_t virtio_gpu_find_pool_base_named(const char *prefix)
 {
 	struct device_node *rmem, *child;
 	phys_addr_t base = 0;
@@ -52,7 +62,7 @@ static phys_addr_t virtio_gpu_find_pool_base(void)
 	for_each_child_of_node(rmem, child) {
 		struct resource res;
 
-		if (!of_node_name_prefix(child, "gpu_blob_reserved"))
+		if (!of_node_name_prefix(child, prefix))
 			continue;
 		if (of_address_to_resource(child, 0, &res) == 0) {
 			base = res.start;
@@ -61,6 +71,15 @@ static phys_addr_t virtio_gpu_find_pool_base(void)
 		}
 	}
 	of_node_put(rmem);
+	return base;
+}
+
+static phys_addr_t virtio_gpu_find_pool_base(void)
+{
+	phys_addr_t base = virtio_gpu_find_pool_base_named("gpu_blob_reserved");
+
+	if (!base)
+		base = virtio_gpu_find_pool_base_named("kgsl_reserved");
 	return base;
 }
 
