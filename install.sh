@@ -1,21 +1,22 @@
 #!/bin/bash
 # DroidVM guest additions installer. Run INSIDE the guest, as root:
 #
-#   curl -L https://raw.githubusercontent.com/Droid-VM/droidvm-guest-additions/3d-accel-gfxstream/install.sh | sudo bash
+#   curl -L https://raw.githubusercontent.com/Droid-VM/droidvm-guest-additions/wip/3d-accel/install.sh | sudo bash
 #
 # or from a checkout: sudo ./install.sh
 #
 # Installs the gunyah_guest + patched virtio-gpu modules as a DKMS package
 # (auto-rebuilds on kernel upgrades) and refreshes the initramfs so early KMS
-# picks up the patched driver. Optionally unpacks a guest mesa tarball
-# (gfxstream ICD + zink) if DROIDVM_MESA_URL is set.
+# picks up the patched driver. Optionally installs a guest mesa if
+# DROIDVM_MESA_URL is set.
 #
 # Env overrides: DROIDVM_GA_REPO (owner/repo), DROIDVM_GA_REF (branch/tag),
-# DROIDVM_MESA_URL (mesa-guest-aarch64.tar.gz URL, unpacked to / + ldconfig).
+# DROIDVM_MESA_URL (a mesa-guest-<variant>_<ver>_arm64.deb, or a legacy
+# mesa-guest tarball -- either a URL or a local path).
 set -euo pipefail
 
 REPO="${DROIDVM_GA_REPO:-Droid-VM/droidvm-guest-additions}"
-REF="${DROIDVM_GA_REF:-3d-accel-gfxstream}"
+REF="${DROIDVM_GA_REF:-wip/3d-accel}"
 PKG=droidvm-guest-additions
 
 msg()  { echo "==> $*"; }
@@ -91,8 +92,30 @@ fi
 
 if [ -n "${DROIDVM_MESA_URL:-}" ]; then
 	msg "installing guest mesa from $DROIDVM_MESA_URL"
-	curl -fL "$DROIDVM_MESA_URL" | tar -xz -C /
-	ldconfig
+	case "$DROIDVM_MESA_URL" in
+	*.deb)
+		# apt, not dpkg -i: the mesa-guest-* packages Conflict with each other
+		# through a shared virtual name, so this is where a guest that already
+		# holds the other route's mesa gets told, instead of the two silently
+		# overwriting each other's libgallium.
+		f=$tmp/mesa-guest.deb
+		case "$DROIDVM_MESA_URL" in
+		http*) curl -fL "$DROIDVM_MESA_URL" -o "$f" ;;
+		*)     cp "$DROIDVM_MESA_URL" "$f" ;;
+		esac
+		apt-get install -y "$f"
+		;;
+	*)
+		warn "installing a mesa TARBALL: nothing will own these files, and unpacking" \
+		     "the other route's mesa on top of it is the black-screen failure." \
+		     "Prefer the .deb from 8_build_guest_mesa_cross.sh."
+		case "$DROIDVM_MESA_URL" in
+		http*) curl -fL "$DROIDVM_MESA_URL" | tar -xz -C / ;;
+		*)     tar -xzf "$DROIDVM_MESA_URL" -C / ;;
+		esac
+		ldconfig
+		;;
+	esac
 fi
 
 inst=$(modinfo -F filename virtio_gpu 2>/dev/null || true)

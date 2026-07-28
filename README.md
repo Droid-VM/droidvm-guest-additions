@@ -21,12 +21,15 @@ See host counterpart Droid-VM/gunyah_host_mod and Droid-VM/droidvm-3d-accel.
 One-liner (inside the guest, installs as a DKMS package that auto-rebuilds on
 guest kernel upgrades, then refreshes the initramfs):
 
-    curl -L https://raw.githubusercontent.com/Droid-VM/droidvm-guest-additions/3d-accel-gfxstream/install.sh | sudo bash
+    curl -L https://raw.githubusercontent.com/Droid-VM/droidvm-guest-additions/wip/3d-accel/install.sh | sudo bash
 
 From a checkout, `sudo ./install.sh` does the same. Optional env vars:
 `DROIDVM_GA_REPO`/`DROIDVM_GA_REF` pick the source repo/branch,
-`DROIDVM_MESA_URL` additionally unpacks a `mesa-guest-aarch64.tar.gz`
-(see `6_build_guest_mesa.sh` in the meta repo) into `/`.
+`DROIDVM_MESA_URL` additionally installs a guest mesa: a
+`mesa-guest-<variant>_<ver>_arm64.deb` from `8_build_guest_mesa_cross.sh` (URL
+or local path), or a legacy tarball. Prefer the deb -- the two variants install
+to the same prefix and Conflict, so dpkg refuses the second one instead of
+silently replacing the first one's libgallium.
 
 Manual DKMS route (what install.sh automates):
 
