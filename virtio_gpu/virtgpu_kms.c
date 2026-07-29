@@ -74,12 +74,15 @@ static phys_addr_t virtio_gpu_find_pool_base_named(const char *prefix)
 	return base;
 }
 
-static phys_addr_t virtio_gpu_find_pool_base(void)
+static phys_addr_t virtio_gpu_find_pool_base(const char **which)
 {
 	phys_addr_t base = virtio_gpu_find_pool_base_named("gpu_blob_reserved");
 
-	if (!base)
+	*which = "gpu_blob_reserved";
+	if (!base) {
 		base = virtio_gpu_find_pool_base_named("drm2kgsl_reserved");
+		*which = "drm2kgsl_reserved";
+	}
 	return base;
 }
 
@@ -175,6 +178,7 @@ int virtio_gpu_init(struct virtio_device *vdev, struct drm_device *dev)
 	/* this will expand later */
 	struct virtqueue *vqs[2];
 	u32 num_scanouts, num_capsets;
+	const char *pool_node;
 	int ret = 0;
 
 	if (!virtio_has_feature(vdev, VIRTIO_F_VERSION_1))
@@ -269,10 +273,12 @@ int virtio_gpu_init(struct virtio_device *vdev, struct drm_device *dev)
 	pr_info("virtio-gpu: has_create_guest_handle=%d\n",
 		vgdev->has_create_guest_handle);
 
-	vgdev->gpu_pool_base = virtio_gpu_find_pool_base();
+	/* Name the node it came from. The two renderers share this path, so a message that
+	 * named one of them was wrong half the time -- and this line is what a bringup checks
+	 * to see whether the host pool bound at all. */
+	vgdev->gpu_pool_base = virtio_gpu_find_pool_base(&pool_node);
 	if (vgdev->gpu_pool_base)
-		DRM_INFO("gfxstream pre-alloc: GpuPool base %pa\n",
-			 &vgdev->gpu_pool_base);
+		DRM_INFO("host pool: %s base %pa\n", pool_node, &vgdev->gpu_pool_base);
 
 	/* DroidVM guest-alloc: bring up the guest-owned pool allocator (gpu_guest_reserved),
 	 * if present. Absent => guest-alloc off (host-alloc / upstream shmem paths only). */

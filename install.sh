@@ -79,8 +79,14 @@ dkms install "$PKG/$ver"
 
 # Early KMS loads virtio-gpu from the initramfs; refresh it so the DKMS copy
 # (updates/dkms outranks in-tree in depmod) is the one baked in.
-msg "updating initramfs"
-update-initramfs -u
+#
+# -k "$(uname -r)", not -u. `update-initramfs -u` rebuilds the initrd for the NEWEST installed
+# kernel, which on a guest that has pulled a kernel update is not the one running -- and dkms
+# just built the module for the running one. The install then reports success while the initrd
+# actually being booted still carries the previous module, and the symptom is the new code
+# silently not taking effect, with modinfo pointing at the right file the whole time.
+msg "updating initramfs for $(uname -r)"
+update-initramfs -u -k "$(uname -r)"
 
 # A leftover blacklist from the pre-DKMS manual-load setup would also block
 # the DKMS module (blacklists act on the module name, not the path).
