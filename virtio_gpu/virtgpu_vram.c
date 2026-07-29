@@ -390,8 +390,30 @@ int virtio_gpu_guest_pool_init(struct virtio_gpu_device *vgdev)
 	}
 	of_node_put(rmem);
 
-	if (!base || !size)
-		return 0; /* guest-alloc pool absent -> feature off */
+	if (!base || !size) {
+		/*
+		 * No pool: guest-alloc blobs fall back to ordinary shmem. That is the correct
+		 * behaviour on a VMM whose host can read guest RAM directly -- plain KVM -- and
+		 * it is why the fallback exists rather than failing the allocation.
+		 *
+		 * It is NOT correct where guest RAM is lent rather than shared, because there the
+		 * host cannot reach those pages at all and the GPU ends up bound to memory the
+		 * guest thinks is private. A restricted-dma-pool in the device tree is that
+		 * platform's fingerprint, so say so loudly there and quietly everywhere else.
+		 * Diagnosing this from the host side means noticing that blob iovecs point below
+		 * the pool base, which is a long way from the symptom.
+		 */
+		struct device_node *rdma =
+			of_find_compatible_node(NULL, NULL, "restricted-dma-pool");
+
+		if (rdma) {
+			pr_warn("virtio-gpu: guest-alloc: no pool in DT, falling back to shmem -- but this VM lends its RAM (restricted-dma-pool present), so the host cannot reach it. Expect the GPU to read the wrong memory. Missing --pre-alloc gpu-guest-mb?\n");
+			of_node_put(rdma);
+		} else {
+			pr_info("virtio-gpu: guest-alloc: no pool in DT, backing blobs from shmem\n");
+		}
+		return 0;
+	}
 
 	/* drm_buddy wants a chunk-aligned size; trim rather than round up, the tail is not ours. */
 	size = ALIGN_DOWN(size, PAGE_SIZE);
