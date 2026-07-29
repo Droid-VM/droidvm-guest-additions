@@ -3,6 +3,7 @@
 
 #include <linux/bitmap.h>
 #include <linux/dma-mapping.h>
+#include <linux/log2.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/sizes.h>
@@ -428,9 +429,30 @@ void virtio_gpu_guest_pool_fini(struct virtio_gpu_device *vgdev)
  * genuinely need one physical run (scanout) would pass DRM_BUDDY_CONTIGUOUS_ALLOCATION; none do
  * today.
  */
+/*
+ * Upper bound on the mem-entries one allocation may turn into.
+ *
+ * Every block becomes one entry on the wire and one item in the host's UDMABUF_CREATE_LIST, and
+ * that ioctl has its own ceiling (udmabuf's list_limit, 1024 upstream; the DroidVM udmabuf module
+ * raises it to 8192).  Exceeding it fails in the host with a bare EINVAL, several layers away
+ * from the allocation that caused it.  Bound it here instead, where the number is known and the
+ * message can say so.
+ *
+ * This is not a granularity setting in disguise: small buffers keep page granularity.  It only
+ * raises the floor for large ones, where a 4 KiB-granular scatter would be both unusable and
+ * pointless.  1024 leaves headroom under the module's 8192 for the host to have its own reasons
+ * to refuse.
+ */
+static int guest_pool_max_nents = 1024;
+module_param_named(guest_pool_max_nents, guest_pool_max_nents, int, 0644);
+MODULE_PARM_DESC(guest_pool_max_nents,
+		 "Max blocks one guest-alloc allocation may scatter into (0 = unbounded). Default 1024.");
+
 int virtio_gpu_guest_pool_alloc(struct virtio_gpu_device *vgdev, u64 size,
 				struct list_head *blocks)
 {
+	int max_nents = READ_ONCE(guest_pool_max_nents);
+	u64 min_bs = PAGE_SIZE;
 	int ret;
 
 	INIT_LIST_HEAD(blocks);
@@ -439,9 +461,28 @@ int virtio_gpu_guest_pool_alloc(struct virtio_gpu_device *vgdev, u64 size,
 
 	size = ALIGN(size, PAGE_SIZE);
 
+	/*
+	 * drm_buddy hands back blocks of at least min_block_size, so requiring size/max_nents is
+	 * what bounds the count -- no post-hoc rejection needed for the common case.  It costs
+	 * allocation flexibility: a pool too fragmented to produce blocks this large now fails
+	 * here rather than succeeding into a list the host cannot accept.  That is the intended
+	 * trade; the failure carries the pool stats, the host's EINVAL would not.
+	 */
+	if (max_nents > 0) {
+		min_bs = max_t(u64, min_bs,
+			       roundup_pow_of_two(DIV_ROUND_UP_ULL(size, max_nents)));
+		if (min_bs > size)
+			min_bs = rounddown_pow_of_two(size);
+		/* drm_buddy rejects a size that is not a multiple of min_block_size.  The slack
+		 * lands inside the last block, which the BO already tolerates: params->size is
+		 * what goes on the wire, and the buddy allocation has always been page-rounded
+		 * above it. */
+		size = ALIGN(size, min_bs);
+	}
+
 	mutex_lock(&vgdev->guest_pool_lock);
 	ret = drm_buddy_alloc_blocks(&vgdev->guest_pool_mm, 0,
-				     vgdev->guest_pool_mm.size, size, PAGE_SIZE,
+				     vgdev->guest_pool_mm.size, size, min_bs,
 				     blocks, 0);
 	mutex_unlock(&vgdev->guest_pool_lock);
 
@@ -544,6 +585,18 @@ int virtio_gpu_guest_pool_create(struct virtio_gpu_device *vgdev,
 		vgdev->guest_pool_multiblock_seen = true;
 		pr_info("virtio-gpu: guest-alloc: scatter allocation in use (%u blocks for %lu bytes)\n",
 			nents, params->size);
+	}
+
+	/*
+	 * virtio_gpu_guest_pool_alloc() already sizes the blocks so this cannot trip, so reaching
+	 * it means the bound and the allocator disagree -- worth saying out loud rather than
+	 * letting the host reject the list with an errno that names none of this.
+	 */
+	if (guest_pool_max_nents > 0 && nents > guest_pool_max_nents) {
+		pr_err("virtio-gpu: guest-alloc: %u blocks for %lu bytes exceeds guest_pool_max_nents=%d; the host's UDMABUF_CREATE_LIST would reject this\n",
+		       nents, params->size, guest_pool_max_nents);
+		ret = -ENOSPC;
+		goto err_obj;
 	}
 
 	ents = kvmalloc_array(nents, sizeof(*ents), GFP_KERNEL);
