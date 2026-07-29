@@ -45,7 +45,7 @@
  * The host-owned pool a pool-resident blob's map_blob offset is relative to.
  *
  * Two hosts emit one: gfxstream's host-visible pool as "gpu_blob_reserved", and
- * virglrenderer's KGSL native-context arena as "kgsl_reserved". A VM runs one
+ * virglrenderer's drm2kgsl native-context arena as "drm2kgsl_reserved". A VM runs one
  * renderer or the other, so at most one is present and the guest does not need
  * to know which it got -- VIRTIO_GPU_MAP_INFO_POOL means "gpu_pool_base + the
  * offset in this response" either way. gpu_blob_reserved is checked first so a
@@ -79,7 +79,7 @@ static phys_addr_t virtio_gpu_find_pool_base(void)
 	phys_addr_t base = virtio_gpu_find_pool_base_named("gpu_blob_reserved");
 
 	if (!base)
-		base = virtio_gpu_find_pool_base_named("kgsl_reserved");
+		base = virtio_gpu_find_pool_base_named("drm2kgsl_reserved");
 	return base;
 }
 

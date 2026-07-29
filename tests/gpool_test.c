@@ -54,7 +54,7 @@ int main(void)
  *
  * Reaching virtio_gpu_guest_pool_create() needs neither a context nor gfxstream: any
  * BLOB_MEM_GUEST blob routes there once the guest-alloc pool exists, so this works on a VM
- * whose mesa is the kgsl variant.
+ * whose mesa is the drm2kgsl variant.
  *
  * What to look for in dmesg afterwards is the block count, not just the exit status:
  *   virtio-gpu: guest-alloc: scatter allocation in use (2 blocks for 134221824 bytes)
