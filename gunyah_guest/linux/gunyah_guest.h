@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0-only */
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * Minimal Gunyah guest-side Resource Manager client: lets a (protected) guest
  * accept a memparcel the host SHARE'd to it at runtime, mapping it into the

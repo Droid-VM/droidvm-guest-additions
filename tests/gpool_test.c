@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright DroidVM contributors
+// Additional permissions apply; see ADDITIONAL-PERMISSIONS in the repository root.
+
 /* Exercise virtio_gpu_guest_pool_alloc()'s derived min_block_size across sizes that pick
  * different values for it -- including one deliberately not a multiple of that block size,
  * which is the case drm_buddy rejects outright if the size is not re-aligned. */
