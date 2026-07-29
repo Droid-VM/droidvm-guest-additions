@@ -460,15 +460,19 @@ void virtio_gpu_guest_pool_fini(struct virtio_gpu_device *vgdev)
  * from the allocation that caused it.  Bound it here instead, where the number is known and the
  * message can say so.
  *
- * This is not a granularity setting in disguise: small buffers keep page granularity.  It only
- * raises the floor for large ones, where a 4 KiB-granular scatter would be both unusable and
- * pointless.  1024 leaves headroom under the module's 8192 for the host to have its own reasons
- * to refuse.
+ * This is not a granularity setting in disguise: min_block_size never goes below PAGE_SIZE, so
+ * small buffers keep page granularity whatever this is set to.  It only lowers the floor for
+ * large ones -- at 16384 a 128 MiB buffer may split at 8 KiB rather than 128 KiB.
+ *
+ * Raising it does not make ordinary allocations more scattered; drm_buddy still hands back the
+ * largest blocks it has, and a healthy pool answers in one. What it changes is the failure mode:
+ * a pool too fragmented to produce large blocks now succeeds with a long list instead of failing.
+ * Set to match the host udmabuf module's list_limit, since that is what has to accept the list.
  */
-static int guest_pool_max_nents = 1024;
+static int guest_pool_max_nents = 16384;
 module_param_named(guest_pool_max_nents, guest_pool_max_nents, int, 0644);
 MODULE_PARM_DESC(guest_pool_max_nents,
-		 "Max blocks one guest-alloc allocation may scatter into (0 = unbounded). Default 1024.");
+		 "Max blocks one guest-alloc allocation may scatter into (0 = unbounded). Default 16384.");
 
 int virtio_gpu_guest_pool_alloc(struct virtio_gpu_device *vgdev, u64 size,
 				struct list_head *blocks)
