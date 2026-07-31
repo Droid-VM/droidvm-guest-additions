@@ -38,17 +38,17 @@
 
 /*
  * DroidVM gfxstream pre-alloc: find the boot-blessed GpuPool base GPA from the
- * /reserved-memory "gpu_blob_reserved@<gpa>" node crosvm emits (no-map, matched by the
+ * /reserved-memory "gfx_host@<gpa>" node crosvm emits (no-map, matched by the
  * Gunyah RM to the SHARE'd pool region). Returns 0 if not present (pre-alloc off).
  */
 /*
  * The host-owned pool a pool-resident blob's map_blob offset is relative to.
  *
- * Two hosts emit one: gfxstream's host-visible pool as "gpu_blob_reserved", and
- * virglrenderer's drm2kgsl native-context arena as "drm2kgsl_reserved". A VM runs one
+ * Two hosts emit one: gfxstream's host-visible pool as "gfx_host", and
+ * virglrenderer's drm2kgsl native-context arena as "drm2kgsl_host". A VM runs one
  * renderer or the other, so at most one is present and the guest does not need
  * to know which it got -- VIRTIO_GPU_MAP_INFO_POOL means "gpu_pool_base + the
- * offset in this response" either way. gpu_blob_reserved is checked first so a
+ * offset in this response" either way. gfx_host is checked first so a
  * host that somehow emitted both keeps the gfxstream meaning.
  */
 static phys_addr_t virtio_gpu_find_pool_base_named(const char *prefix)
@@ -76,12 +76,12 @@ static phys_addr_t virtio_gpu_find_pool_base_named(const char *prefix)
 
 static phys_addr_t virtio_gpu_find_pool_base(const char **which)
 {
-	phys_addr_t base = virtio_gpu_find_pool_base_named("gpu_blob_reserved");
+	phys_addr_t base = virtio_gpu_find_pool_base_named("gfx_host");
 
-	*which = "gpu_blob_reserved";
+	*which = "gfx_host";
 	if (!base) {
-		base = virtio_gpu_find_pool_base_named("drm2kgsl_reserved");
-		*which = "drm2kgsl_reserved";
+		base = virtio_gpu_find_pool_base_named("drm2kgsl_host");
+		*which = "drm2kgsl_host";
 	}
 	return base;
 }
@@ -280,7 +280,7 @@ int virtio_gpu_init(struct virtio_device *vdev, struct drm_device *dev)
 	if (vgdev->gpu_pool_base)
 		DRM_INFO("host pool: %s base %pa\n", pool_node, &vgdev->gpu_pool_base);
 
-	/* DroidVM guest-alloc: bring up the guest-owned pool allocator (gpu_guest_reserved),
+	/* DroidVM guest-alloc: bring up the guest-owned pool allocator (gpu_guest),
 	 * if present. Absent => guest-alloc off (host-alloc / upstream shmem paths only). */
 	ret = virtio_gpu_guest_pool_init(vgdev);
 	if (ret)

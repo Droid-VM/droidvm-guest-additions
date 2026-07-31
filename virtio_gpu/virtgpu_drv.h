@@ -166,7 +166,7 @@ struct virtio_gpu_object_vram {
 	u64 pool_offset;
 	/*
 	 * DroidVM guest-alloc: this pool-resident blob was sub-allocated by the GUEST driver
-	 * from the gpu_guest_reserved pool (not the host). The guest built the mem-entries
+	 * from the gpu_guest pool (not the host). The guest built the mem-entries
 	 * (pool GPAs) itself and must return the blocks to its own allocator on free.
 	 *
 	 * guest_pool_blocks holds them, in the order they were handed out -- the same order the
@@ -331,12 +331,12 @@ struct virtio_gpu_device {
 	 * which the RM rejects (mem_share EINVAL at offset 0). */
 	struct drm_mm_node host_visible_guard;
 	/* DroidVM gfxstream pre-alloc: guest physical base of the boot-blessed GpuPool
-	 * (from the /reserved-memory "gpu_blob_reserved" DT node), or 0 if absent. A
+	 * (from the /reserved-memory "gfx_host" DT node), or 0 if absent. A
 	 * pool-resident blob maps gpu_pool_base + pool_offset directly. */
 	phys_addr_t gpu_pool_base;
 
 	/* DroidVM guest-alloc: the separate boot-blessed guest-alloc pool (from the
-	 * "gpu_guest_reserved" DT node). The guest driver OWNS this region: it sub-allocates
+	 * "gpu_guest" DT node). The guest driver OWNS this region: it sub-allocates
 	 * BLOB_MEM_GUEST backing from it (page-granular bitmap) and hands the pool GPAs to the
 	 * host as ordinary mem-entries, so the official attach_iov path works in a protected VM
 	 * (the pool is host-accessible, unlike arbitrary guest RAM). Zero base = guest-alloc off. */
@@ -604,7 +604,7 @@ int virtio_gpu_vram_create(struct virtio_gpu_device *vgdev,
 			   struct virtio_gpu_object_params *params,
 			   struct virtio_gpu_object **bo_ptr);
 
-/* DroidVM guest-alloc pool (gpu_guest_reserved), in virtgpu_vram.c */
+/* DroidVM guest-alloc pool (gpu_guest), in virtgpu_vram.c */
 int virtio_gpu_guest_pool_init(struct virtio_gpu_device *vgdev);
 void virtio_gpu_guest_pool_fini(struct virtio_gpu_device *vgdev);
 /* Reserve npages contiguous pages; returns byte offset within the pool, or -1 on OOM. */

@@ -110,7 +110,7 @@ static int virtio_gpu_vram_mmap(struct drm_gem_object *obj,
 		struct drm_buddy_block *block;
 
 		if (!vgdev->gpu_guest_pool_base) {
-			pr_err("virtio-gpu: guest-alloc blob but no gpu_guest_reserved base in DT\n");
+			pr_err("virtio-gpu: guest-alloc blob but no gpu_guest base in DT\n");
 			return -EINVAL;
 		}
 
@@ -352,9 +352,9 @@ int virtio_gpu_vram_create(struct virtio_gpu_device *vgdev,
 }
 
 /* ===================================================================
- * DroidVM guest-alloc pool (gpu_guest_reserved)
+ * DroidVM guest-alloc pool (gpu_guest)
  *
- * A page-granular bitmap allocator over the boot-blessed "gpu_guest_reserved"
+ * A page-granular bitmap allocator over the boot-blessed "gpu_guest"
  * region. The guest driver OWNS this pool: BLOB_MEM_GUEST blobs are backed by
  * pages carved from it, and the pool GPAs are handed to the host as ordinary
  * mem-entries. Because the region is SHARE-blessed (host-accessible, unlike
@@ -379,7 +379,7 @@ int virtio_gpu_guest_pool_init(struct virtio_gpu_device *vgdev)
 	if (!rmem)
 		return 0;
 	for_each_child_of_node(rmem, child) {
-		if (!of_node_name_prefix(child, "gpu_guest_reserved"))
+		if (!of_node_name_prefix(child, "gpu_guest"))
 			continue;
 		if (of_address_to_resource(child, 0, &res) == 0) {
 			base = res.start;

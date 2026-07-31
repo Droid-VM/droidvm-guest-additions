@@ -295,6 +295,11 @@ struct virtio_gunyah_accept_comp {
 #define VGP_OP_SHARE	1
 #define VGP_OP_UNSHARE	2
 #define VGP_OP_QUERY	3
+/* Debug-only, for the growable-pool test driver: take/drop the reference a dma-buf import would.
+ * Lets the "a grant in use cannot be released" path be exercised without making the pool the GPU
+ * uses growable. */
+#define VGP_OP_TEST_REF		100
+#define VGP_OP_TEST_UNREF	101
 
 struct virtio_gunyah_pool_req {
 	__le32 req_id;		/* guest-assigned; echoed back in the response */
@@ -600,6 +605,15 @@ int gunyah_pool_query(u32 pool_id, u64 *live_grants)
 	return vga_pool_request(VGP_OP_QUERY, pool_id, 0, 0, live_grants);
 }
 EXPORT_SYMBOL_GPL(gunyah_pool_query);
+
+/* Debug only. Stands in for a host-side dma-buf import so a test can check that a grant with
+ * something built over it refuses to be released. Not for production callers. */
+int gunyah_pool_test_ref(u32 pool_id, u64 offset, u64 len, bool take)
+{
+	return vga_pool_request(take ? VGP_OP_TEST_REF : VGP_OP_TEST_UNREF,
+				pool_id, offset, len, NULL);
+}
+EXPORT_SYMBOL_GPL(gunyah_pool_test_ref);
 
 static int vga_probe(struct virtio_device *vdev)
 {

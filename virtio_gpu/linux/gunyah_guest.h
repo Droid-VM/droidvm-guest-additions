@@ -50,6 +50,9 @@ int gunyah_pool_shrink(u32 pool_id, u64 offset, u64 len);
  * which means the request's fate is UNKNOWN, not that it failed -- or after a driver reload.
  */
 int gunyah_pool_query(u32 pool_id, u64 *live_grants);
+/* Debug only: take (@take) or drop the host-side reference a dma-buf import would hold, so a test
+ * can verify that a grant in use refuses to be released. Not for production callers. */
+int gunyah_pool_test_ref(u32 pool_id, u64 offset, u64 len, bool take);
 #else
 static inline bool gunyah_guest_available(void) { return false; }
 static inline int gunyah_guest_mem_accept(u32 handle, u64 gpa, u64 size) { return -ENODEV; }
@@ -57,6 +60,7 @@ static inline int gunyah_guest_mem_release(u32 handle) { return -ENODEV; }
 static inline int gunyah_pool_grow(u32 p, u64 o, u64 l) { return -ENODEV; }
 static inline int gunyah_pool_shrink(u32 p, u64 o, u64 l) { return -ENODEV; }
 static inline int gunyah_pool_query(u32 p, u64 *n) { return -ENODEV; }
+static inline int gunyah_pool_test_ref(u32 p, u64 o, u64 l, bool t) { return -ENODEV; }
 #endif
 
 #endif /* _LINUX_GUNYAH_GUEST_H */

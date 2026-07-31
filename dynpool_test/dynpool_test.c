@@ -172,6 +172,49 @@ static void test_rejections(void)
 	}
 }
 
+/*
+ * A grant with something built over it must refuse to be released.
+ *
+ * The reference a real dma-buf import takes is only taken for pools with a non-zero step, and the
+ * pool the GPU uses is fully pre-shared -- so without a way to take one by hand, this path could
+ * not be reached on device at all. gunyah_pool_test_ref stands in for the import.
+ */
+static void test_busy(void)
+{
+	u64 off = pool_prealloc, len = pool_step;
+	int rc;
+
+	say("busy:\n");
+	if (pool_step == 0 || pool_prealloc >= pool_size) {
+		say("  pool is not growable; nothing to do\n");
+		return;
+	}
+
+	rc = gunyah_pool_grow(pool_id, off, len);
+	say("  grow                          -> %d\n", rc);
+	if (rc)
+		return;
+
+	rc = gunyah_pool_test_ref(pool_id, off, len, true);
+	say("  take a reference              -> %d %s\n", rc, rc == 0 ? "ok" : "UNEXPECTED");
+
+	rc = gunyah_pool_shrink(pool_id, off, len);
+	say("  shrink while referenced       -> %d %s\n", rc,
+	    rc == -EBUSY ? "ok (refused)" : "UNEXPECTED -- it should have been refused");
+
+	rc = gunyah_pool_test_ref(pool_id, off, len, false);
+	say("  drop the reference            -> %d\n", rc);
+
+	rc = gunyah_pool_shrink(pool_id, off, len);
+	say("  shrink after dropping it      -> %d %s\n", rc, rc == 0 ? "ok" : "UNEXPECTED");
+
+	/* A reference is refused outright over memory that was never granted -- the same check
+	 * that stops a dma-buf being built over a hole in the sparse pool memfd. */
+	rc = gunyah_pool_test_ref(pool_id, off, len, true);
+	say("  reference an ungranted range  -> %d %s\n", rc,
+	    rc == -EFAULT ? "ok (refused)" : "UNEXPECTED -- it should have been refused");
+}
+
 static void test_selftest(void)
 {
 	u64 off = pool_prealloc;
@@ -244,6 +287,8 @@ static ssize_t cmd_store(struct kobject *k, struct kobj_attribute *a,
 		test_selftest();
 	} else if (!strcmp(verb, "reject")) {
 		test_rejections();
+	} else if (!strcmp(verb, "busy")) {
+		test_busy();
 	} else if (!strcmp(verb, "grow") && n == 3) {
 		rc = gunyah_pool_grow(pool_id, a_mb * MB, b_mb * MB);
 		say("grow %llu MB at +%llu MB -> %d\n", b_mb, a_mb, rc);
@@ -253,7 +298,7 @@ static ssize_t cmd_store(struct kobject *k, struct kobj_attribute *a,
 	} else if (!strcmp(verb, "verify") && n == 3) {
 		verify_range(a_mb * MB, b_mb * MB);
 	} else {
-		say("usage: selftest | reject | grow <off_mb> <len_mb> | "
+		say("usage: selftest | reject | busy | grow <off_mb> <len_mb> | "
 		    "shrink <off_mb> <len_mb> | verify <off_mb> <len_mb>\n");
 	}
 out:
