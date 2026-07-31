@@ -42,7 +42,18 @@ fi
 msg "installing build dependencies"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq dkms build-essential "linux-headers-$(uname -r)" \
+# linux-headers-generic, the META-package, and not only the versioned headers for the kernel
+# running right now.
+#
+# The versioned package alone covers today and nothing else: when the guest later pulls a kernel
+# update, headers for THAT kernel never arrive, dkms cannot build, and the new kernel boots with
+# no virtio-gpu and no gunyah_guest. That is not hypothetical -- this guest reached exactly that
+# state, and the workaround was pinning GRUB to the old kernel, which then made
+# `update-initramfs -u` silently update an initrd nothing boots.
+#
+# The meta-package depends on the current series' headers and apt keeps it in step, so every
+# kernel upgrade brings the headers with it and dkms AUTOINSTALL rebuilds unprompted.
+apt-get install -y -qq dkms build-essential linux-headers-generic "linux-headers-$(uname -r)" \
 	curl ca-certificates
 
 # Source: the directory this script lives in if it's a checkout (has dkms.conf),
