@@ -589,7 +589,8 @@ static int virtio_gpu_resource_create_blob_ioctl(struct drm_device *dev,
 		 * back BLOB_MEM_GUEST from it (pages the host can resolve via attach_iov in a
 		 * protected VM) instead of arbitrary shmem RAM (unreachable by the host in pVM).
 		 */
-		pr_info("VGBLOB-ROUTE: guest_blob mem=%u flags=0x%x size=%llu guest_pool=%d\n",
+		pr_info("VGBLOB-ROUTE: comm=%s pid=%d guest_blob mem=%u flags=0x%x size=%llu guest_pool=%d\n",
+			current->comm, current->pid,
 			rc_blob->blob_mem, rc_blob->blob_flags,
 			(unsigned long long)rc_blob->size,
 			vgdev->gpu_guest_pool_base ? 1 : 0);

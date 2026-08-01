@@ -569,7 +569,8 @@ int virtio_gpu_guest_pool_create(struct virtio_gpu_device *vgdev,
 		u64 total, used, largest;
 
 		virtio_gpu_guest_pool_stats(vgdev, &total, &used, &largest);
-		pr_err("VGBLOB-DBG: guest-alloc pool OOM size=%llu (pool %llu MiB, used %llu MiB, largest %llu MiB)\n",
+		pr_err("VGBLOB-DBG: guest-alloc pool OOM comm=%s pid=%d size=%llu (pool %llu MiB, used %llu MiB, largest %llu MiB)\n",
+		       current->comm, current->pid,
 		       (unsigned long long)params->size, total >> 20, used >> 20,
 		       largest >> 20);
 		return -ENOMEM;
