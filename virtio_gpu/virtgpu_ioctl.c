@@ -589,7 +589,7 @@ static int virtio_gpu_resource_create_blob_ioctl(struct drm_device *dev,
 		 * back BLOB_MEM_GUEST from it (pages the host can resolve via attach_iov in a
 		 * protected VM) instead of arbitrary shmem RAM (unreachable by the host in pVM).
 		 */
-		pr_info("VGBLOB-ROUTE: comm=%s pid=%d guest_blob mem=%u flags=0x%x size=%llu guest_pool=%d\n",
+		virtio_gpu_trace("VGBLOB-ROUTE: comm=%s pid=%d guest_blob mem=%u flags=0x%x size=%llu guest_pool=%d\n",
 			current->comm, current->pid,
 			rc_blob->blob_mem, rc_blob->blob_flags,
 			(unsigned long long)rc_blob->size,
@@ -600,7 +600,7 @@ static int virtio_gpu_resource_create_blob_ioctl(struct drm_device *dev,
 			ret = virtio_gpu_object_create(vgdev, &params, &bo, NULL);
 	} else if (!guest_blob && host3d_blob) {
 		ret = virtio_gpu_vram_create(vgdev, &params, &bo);
-		pr_info("VGBLOB-BAR: comm=%s pid=%d res=%u size=%llu flags=0x%x mappable=%d\n",
+		virtio_gpu_trace("VGBLOB-BAR: comm=%s pid=%d res=%u size=%llu flags=0x%x mappable=%d\n",
 			current->comm, current->pid,
 			ret == 0 ? bo->hw_res_handle : 0,
 			(unsigned long long)rc_blob->size, rc_blob->blob_flags,

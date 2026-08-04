@@ -52,6 +52,19 @@ static int virtio_gpu_modeset = -1;
 MODULE_PARM_DESC(modeset, "Disable/Enable modesetting");
 module_param_named(modeset, virtio_gpu_modeset, int, 0400);
 
+/*
+ * Per-operation tracing, off by default. The traces it guards fire once per blob creation --
+ * hundreds per desktop session, thousands under a benchmark -- and printk is not free on the path
+ * that allocates rendering memory. The failure paths are not covered by this: those stay at
+ * pr_err unconditionally, because they only speak when something is actually wrong.
+ *
+ * Toggle at runtime: /sys/module/virtio_gpu/parameters/droidvm_trace
+ */
+bool virtio_gpu_droidvm_trace;
+EXPORT_SYMBOL_GPL(virtio_gpu_droidvm_trace);
+MODULE_PARM_DESC(droidvm_trace, "Trace each DroidVM blob allocation (default off)");
+module_param_named(droidvm_trace, virtio_gpu_droidvm_trace, bool, 0644);
+
 static int virtio_gpu_pci_quirk(struct drm_device *dev)
 {
 	struct pci_dev *pdev = to_pci_dev(dev->dev);

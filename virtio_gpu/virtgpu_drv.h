@@ -627,4 +627,13 @@ void virtio_gpu_vram_unmap_dma_buf(struct device *dev,
 int virtio_gpu_execbuffer_ioctl(struct drm_device *dev, void *data,
 				struct drm_file *file);
 
+
+/* See virtgpu_drv.c: per-operation tracing, off unless droidvm_trace is set. */
+extern bool virtio_gpu_droidvm_trace;
+#define virtio_gpu_trace(fmt, ...)                     \
+	do {                                           \
+		if (virtio_gpu_droidvm_trace)          \
+			pr_info(fmt, ##__VA_ARGS__);   \
+	} while (0)
+
 #endif
