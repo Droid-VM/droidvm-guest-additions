@@ -39,10 +39,30 @@ die() { echo "error: $*" >&2; exit 1; }
 # the /usr/src directory name. Keeping them equal is what makes `dkms status` name the exact tree
 # a guest is running, and what lets two builds of "1.0" coexist in a log without ambiguity.
 # rpm allows '+' in Version but not '-', which is why the separator is a dot.
+#
+# A commit count leads and the hash only identifies: a package manager compares versions, and a
+# hash does not order. "+droidvm.cea49934" is LOWER than "+droidvm.f80a84b5" no matter which was
+# built first, so upgrading to a newer build needed --allow-downgrades and `apt upgrade` could
+# quietly keep the older one. Counting commits gives a number that only goes up, on a branch that
+# is never rewritten.
+#
+# The "r" is what makes the change of scheme itself an upgrade rather than a downgrade: dpkg would
+# otherwise compare the letters of an old "cea49934" against the empty run before "250" and rank
+# the letters higher. A hash is hex and starts with 0-9 or a-f, so any letter past 'f' outranks
+# every version already installed. (rpm ranks a digit segment above an alpha one, so an old rpm
+# whose hash began with a digit would still need --oldpackage; the rpm path is not one we ship.)
+#
+# A modified tree gets a suffix as well, because otherwise an uncommitted change rebuilds to the
+# same filename with different contents -- a package that installs a build you can no longer
+# identify. It sorts after the clean build of that commit and before the next commit, which is
+# exactly where it belongs.
 base=$(sed -n 's/^PACKAGE_VERSION="\(.*\)"$/\1/p' dkms.conf)
 [ -n "$base" ] || die "cannot read PACKAGE_VERSION from dkms.conf"
+count=$(git rev-list --count HEAD 2>/dev/null || echo 0)
 sha=$(git rev-parse --short=8 HEAD 2>/dev/null || echo unknown)
-VER="${base}+droidvm.${sha}"
+dirty=""
+git diff --quiet HEAD -- 2>/dev/null || dirty="+dirty$(LC_ALL=C date -u '+%Y%m%d%H%M%S')"
+VER="${base}+droidvm.r${count}.g${sha}${dirty}"
 msg "version $VER"
 
 STAGE=$(mktemp -d)
