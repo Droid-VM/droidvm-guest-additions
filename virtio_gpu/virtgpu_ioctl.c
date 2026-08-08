@@ -629,7 +629,9 @@ static int virtio_gpu_resource_create_blob_ioctl(struct drm_device *dev,
 			pr_err("VGBLOB-DBG: assign_uuid FAILED ret=%d flags=0x%x size=%llu\n",
 			       ret, rc_blob->blob_flags,
 			       (unsigned long long)rc_blob->size);
-			drm_gem_object_release(obj);
+			/* Drop the creator's reference so the async RESOURCE_UNREF callback can return
+			 * guest-pool blocks only after the host has discarded the resource. */
+			drm_gem_object_put(obj);
 			return ret;
 		}
 	}
@@ -639,7 +641,9 @@ static int virtio_gpu_resource_create_blob_ioctl(struct drm_device *dev,
 		pr_err("VGBLOB-DBG: handle_create FAILED ret=%d flags=0x%x size=%llu\n",
 		       ret, rc_blob->blob_flags,
 		       (unsigned long long)rc_blob->size);
-		drm_gem_object_release(obj);
+		/* The object already owns a live host resource and, for guest-pool blobs, a
+		 * pool allocation. Let its normal free path perform RESOURCE_UNREF. */
+		drm_gem_object_put(obj);
 		return ret;
 	}
 
