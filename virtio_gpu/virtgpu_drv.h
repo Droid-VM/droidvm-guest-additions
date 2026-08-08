@@ -106,6 +106,9 @@
 #define DRIVER_MINOR 1
 #define DRIVER_PATCHLEVEL 0
 
+/* Android AHB RGBA_8888 is DRM ABGR8888 on little-endian guests. */
+#define VIRTIO_GPU_PRIMARY_FORMAT DRM_FORMAT_ABGR8888
+
 #define STATE_INITIALIZING 0
 #define STATE_OK 1
 #define STATE_ERR 2
