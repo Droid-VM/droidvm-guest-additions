@@ -384,9 +384,11 @@ static int vga_do_release(struct vga_dev *vga, u64 gpa)
 			/* Release BEFORE the host unshares/reuses the gpa
 			 * (same ordering invariant as virtgpu_vram.c). */
 			ret = gunyah_guest_mem_release(ent->handle);
+			if (ret)
+				return ret;
 			list_del(&ent->node);
 			kfree(ent);
-			return ret;
+			return 0;
 		}
 	}
 	return -ENOENT;
@@ -605,6 +607,23 @@ int gunyah_pool_query(u32 pool_id, u64 *live_grants)
 	return vga_pool_request(VGP_OP_QUERY, pool_id, 0, 0, live_grants);
 }
 EXPORT_SYMBOL_GPL(gunyah_pool_query);
+
+/* Query one range rather than only the total grant count. This is the only safe way to recover
+ * from a timed-out SHARE/UNSHARE: the host may have completed the request even though its reply
+ * was lost, and a count cannot tell the caller which range changed state. */
+int gunyah_pool_query_range(u32 pool_id, u64 offset, u64 len, bool *backed)
+{
+	u64 extra = 0;
+	int ret;
+
+	if (!backed)
+		return -EINVAL;
+	ret = vga_pool_request(VGP_OP_QUERY, pool_id, offset, len, &extra);
+	if (!ret)
+		*backed = !!extra;
+	return ret;
+}
+EXPORT_SYMBOL_GPL(gunyah_pool_query_range);
 
 /* Debug only. Stands in for a host-side dma-buf import so a test can check that a grant with
  * something built over it refuses to be released. Not for production callers. */

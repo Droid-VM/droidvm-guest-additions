@@ -53,6 +53,15 @@
 #include <drm/drm_probe_helper.h>
 #include <drm/virtgpu_drm.h>
 
+/* drm_buddy_free_list() gained the flags argument with clear-page tracking in 6.10. */
+#ifdef DRM_BUDDY_CLEAR_ALLOCATION
+#define droidvm_drm_buddy_free_list(mm, objects) \
+	drm_buddy_free_list((mm), (objects), 0)
+#else
+#define droidvm_drm_buddy_free_list(mm, objects) \
+	drm_buddy_free_list((mm), (objects))
+#endif
+
 /* DroidVM guest-alloc: crosvm's downstream virtio feature (bit 6) + getparam (10). The kernel's
  * <linux/virtio_gpu.h> / <drm/virtgpu_drm.h> predate them, and the fork's uapi copy is shadowed by
  * the kernel header's include guard -- so define them here (included by every driver TU). */
@@ -96,6 +105,9 @@
 #define DRIVER_MAJOR 0
 #define DRIVER_MINOR 1
 #define DRIVER_PATCHLEVEL 0
+
+/* Android AHB RGBA_8888 is DRM ABGR8888 on little-endian guests. */
+#define VIRTIO_GPU_PRIMARY_FORMAT DRM_FORMAT_ABGR8888
 
 #define STATE_INITIALIZING 0
 #define STATE_OK 1
@@ -337,11 +349,17 @@ struct virtio_gpu_device {
 
 	/* DroidVM guest-alloc: the separate boot-blessed guest-alloc pool (from the
 	 * "gpu_guest" DT node). The guest driver OWNS this region: it sub-allocates
-	 * BLOB_MEM_GUEST backing from it (page-granular bitmap) and hands the pool GPAs to the
+	 * BLOB_MEM_GUEST backing from it (drm_buddy) and hands the pool GPAs to the
 	 * host as ordinary mem-entries, so the official attach_iov path works in a protected VM
 	 * (the pool is host-accessible, unlike arbitrary guest RAM). Zero base = guest-alloc off. */
 	phys_addr_t gpu_guest_pool_base;
 	u64 gpu_guest_pool_size;
+	/* Dynamic guest pool metadata. The full drm_buddy tree exists for the whole window, but
+	 * allocations are restricted to this currently SHARE'd prefix. */
+	u32 gpu_guest_pool_id;
+	u64 gpu_guest_pool_prealloc;
+	u64 gpu_guest_pool_backed;
+	u64 gpu_guest_pool_step;
 	/*
 	 * drm_buddy, not the page bitmap it replaced. The bitmap could only hand out one
 	 * contiguous run (bitmap_find_next_zero_area), so an allocation failed as soon as the
@@ -361,6 +379,7 @@ struct virtio_gpu_device {
 	 * failures -- a single-block-only run would look identical from outside. */
 	bool guest_pool_multiblock_seen;
 	struct mutex guest_pool_lock;
+	struct delayed_work guest_pool_reclaim_work;
 
 	struct work_struct config_changed_work;
 
@@ -611,6 +630,8 @@ void virtio_gpu_guest_pool_fini(struct virtio_gpu_device *vgdev);
 int virtio_gpu_guest_pool_alloc(struct virtio_gpu_device *vgdev, u64 size,
 				struct list_head *blocks);
 void virtio_gpu_guest_pool_free(struct virtio_gpu_device *vgdev, struct list_head *blocks);
+void virtio_gpu_guest_pool_release_object(struct virtio_gpu_device *vgdev,
+					  struct virtio_gpu_object *bo);
 void virtio_gpu_guest_pool_stats(struct virtio_gpu_device *vgdev, u64 *total_bytes,
 				 u64 *used_bytes, u64 *largest_free_bytes);
 int virtio_gpu_guest_pool_create(struct virtio_gpu_device *vgdev,

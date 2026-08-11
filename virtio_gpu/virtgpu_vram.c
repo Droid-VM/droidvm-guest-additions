@@ -3,10 +3,12 @@
 
 #include <linux/bitmap.h>
 #include <linux/dma-mapping.h>
+#include <linux/errno.h>
 #include <linux/log2.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/sizes.h>
+#include <linux/gunyah_guest.h>
 
 static void virtio_gpu_vram_free(struct drm_gem_object *obj)
 {
@@ -32,14 +34,8 @@ static void virtio_gpu_vram_free(struct drm_gem_object *obj)
 		virtio_gpu_cmd_unref_resource(vgdev, bo);
 		virtio_gpu_notify(vgdev);
 
-		/*
-		 * DroidVM guest-alloc: this blob's backing was sub-allocated by us from the
-		 * guest-alloc pool. The host has now dropped its reference (unref above), so
-		 * return the blocks to the allocator. (Host-alloc pool_resident blobs are freed
-		 * host-side and never set guest_pool_owned.)
-		 */
-		if (vram->guest_pool_owned)
-			virtio_gpu_guest_pool_free(vgdev, &vram->guest_pool_blocks);
+		/* Guest-pool blocks are returned from virtio_gpu_cmd_unref_cb, after the host's
+		 * RESOURCE_UNREF response confirms that crosvm has dropped its pool reference. */
 		return;
 	}
 }
@@ -180,13 +176,64 @@ struct sg_table *virtio_gpu_vram_map_dma_buf(struct virtio_gpu_object *bo,
 {
 	struct virtio_gpu_device *vgdev = bo->base.base.dev->dev_private;
 	struct virtio_gpu_object_vram *vram = to_virtio_gpu_vram(bo);
+	struct drm_buddy_block *block;
+	struct scatterlist *sg;
 	struct sg_table *sgt;
 	dma_addr_t addr;
+	u32 nents = 0;
+	unsigned int i, mapped = 0;
 	int ret;
 
 	sgt = kzalloc_obj(*sgt);
 	if (!sgt)
 		return ERR_PTR(-ENOMEM);
+
+	if (vram->guest_pool_owned) {
+		/* Guest-pool blobs are scatter-backed. Mapping vram_node.start here would map
+		 * physical address zero because guest-pool objects do not reserve a drm_mm node. */
+		list_for_each_entry(block, &vram->guest_pool_blocks, link)
+			nents++;
+		if (!nents) {
+			ret = -EINVAL;
+			goto out;
+		}
+
+		ret = sg_alloc_table(sgt, nents, GFP_KERNEL);
+		if (ret)
+			goto out;
+
+		/* Build one DMA segment per buddy block. The block list and sg list have the same
+		 * order, so a single cursor for each is sufficient. */
+		sg = sgt->sgl;
+		list_for_each_entry(block, &vram->guest_pool_blocks, link) {
+			phys_addr_t pa = vgdev->gpu_guest_pool_base +
+				drm_buddy_block_offset(block);
+			u64 len = drm_buddy_block_size(&vgdev->guest_pool_mm, block);
+
+			addr = dma_map_resource(dev, pa, len, dir,
+						DMA_ATTR_SKIP_CPU_SYNC);
+			if (dma_mapping_error(dev, addr)) {
+				ret = -EIO;
+				goto err_unmap_guest;
+			}
+			sg_set_page(sg, NULL, len, 0);
+			sg_dma_address(sg) = addr;
+			sg_dma_len(sg) = len;
+			mapped++;
+			sg = sg_next(sg);
+		}
+		return sgt;
+
+err_unmap_guest:
+		for_each_sg(sgt->sgl, sg, mapped, i) {
+			if (sg_dma_len(sg))
+				dma_unmap_resource(dev, sg_dma_address(sg), sg_dma_len(sg), dir,
+						   DMA_ATTR_SKIP_CPU_SYNC);
+		}
+		sg_free_table(sgt);
+		kfree(sgt);
+		return ERR_PTR(ret);
+	}
 
 	if (!(bo->blob_flags & VIRTGPU_BLOB_FLAG_USE_MAPPABLE)) {
 		// Virtio devices can access the dma-buf via its UUID. Return a stub
@@ -221,13 +268,16 @@ out:
 }
 
 void virtio_gpu_vram_unmap_dma_buf(struct device *dev,
-				   struct sg_table *sgt,
-				   enum dma_data_direction dir)
+					   struct sg_table *sgt,
+					   enum dma_data_direction dir)
 {
-	if (sgt->nents) {
-		dma_unmap_resource(dev, sg_dma_address(sgt->sgl),
-				   sg_dma_len(sgt->sgl), dir,
-				   DMA_ATTR_SKIP_CPU_SYNC);
+	struct scatterlist *sg;
+	unsigned int i;
+
+	for_each_sgtable_sg(sgt, sg, i) {
+		if (sg_dma_len(sg))
+			dma_unmap_resource(dev, sg_dma_address(sg), sg_dma_len(sg), dir,
+					   DMA_ATTR_SKIP_CPU_SYNC);
 	}
 	sg_free_table(sgt);
 	kfree(sgt);
@@ -354,26 +404,57 @@ int virtio_gpu_vram_create(struct virtio_gpu_device *vgdev,
 /* ===================================================================
  * DroidVM guest-alloc pool (gpu_guest)
  *
- * A page-granular bitmap allocator over the boot-blessed "gpu_guest"
- * region. The guest driver OWNS this pool: BLOB_MEM_GUEST blobs are backed by
- * pages carved from it, and the pool GPAs are handed to the host as ordinary
- * mem-entries. Because the region is SHARE-blessed (host-accessible, unlike
- * arbitrary guest RAM), the host resolves those entries via the official
- * attach_iov path -- so guest-alloc works in a protected VM.
- *
- * Increment 1: single contiguous run per blob (the pool is fresh/large, so
- * contiguity holds); a multi-run scatter-gather variant (matching upstream
- * shmem fragmentation) is a follow-up. Mapping is still the inherited
- * (write-combine) pgprot; cacheable is a follow-up.
+ * The guest owns the drm_buddy allocator and hands the host pool GPAs as ordinary mem-entries.
+ * A dynamic pool is declared at its full size in DT but only has a SHARE'd prefix initially;
+ * gpu_guest_pool_backed is the access boundary. Extending that boundary is a synchronous pool
+ * SHARE, and shrinking is restricted to completely free suffix steps so no live BO moves.
  * =================================================================== */
+
+static void virtio_gpu_guest_pool_reclaim_work(struct work_struct *work);
+static bool virtio_gpu_guest_pool_reclaim_locked(struct virtio_gpu_device *vgdev);
+
+static int virtio_gpu_guest_pool_grow_one_locked(struct virtio_gpu_device *vgdev)
+{
+	u64 offset;
+	bool range_backed = false;
+	int ret;
+
+	if (!vgdev->gpu_guest_pool_step ||
+	    vgdev->gpu_guest_pool_backed >= vgdev->gpu_guest_pool_size)
+		return -ENOSPC;
+	if (vgdev->gpu_guest_pool_step >
+	    vgdev->gpu_guest_pool_size - vgdev->gpu_guest_pool_backed)
+		return -EINVAL;
+
+	offset = vgdev->gpu_guest_pool_backed;
+	ret = gunyah_pool_grow(vgdev->gpu_guest_pool_id, offset,
+				       vgdev->gpu_guest_pool_step);
+	if (ret == -ETIMEDOUT || ret == -EEXIST) {
+		/* The host may have completed SHARE before its response was lost. */
+		int query_ret = gunyah_pool_query_range(
+			vgdev->gpu_guest_pool_id, offset,
+			vgdev->gpu_guest_pool_step, &range_backed);
+
+		if (!query_ret && range_backed)
+			ret = 0;
+	}
+	if (!ret)
+		vgdev->gpu_guest_pool_backed += vgdev->gpu_guest_pool_step;
+
+	return ret;
+}
 
 int virtio_gpu_guest_pool_init(struct virtio_gpu_device *vgdev)
 {
 	struct device_node *rmem, *child;
 	struct resource res;
 	phys_addr_t base = 0;
-	u64 size = 0;
+	u64 size = 0, prealloc = 0, step = 0;
+	u32 pool_id = 0;
 	int ret;
+
+	INIT_DELAYED_WORK(&vgdev->guest_pool_reclaim_work,
+			  virtio_gpu_guest_pool_reclaim_work);
 
 	rmem = of_find_node_by_path("/reserved-memory");
 	if (!rmem)
@@ -384,6 +465,10 @@ int virtio_gpu_guest_pool_init(struct virtio_gpu_device *vgdev)
 		if (of_address_to_resource(child, 0, &res) == 0) {
 			base = res.start;
 			size = resource_size(&res);
+			if (of_property_read_u64(child, "droidvm,pre-alloc-size", &prealloc))
+				prealloc = size;
+			of_property_read_u64(child, "droidvm,step-size", &step);
+			of_property_read_u32(child, "droidvm,pool-id", &pool_id);
 			of_node_put(child);
 			break;
 		}
@@ -419,6 +504,22 @@ int virtio_gpu_guest_pool_init(struct virtio_gpu_device *vgdev)
 	size = ALIGN_DOWN(size, PAGE_SIZE);
 	if (!size)
 		return 0;
+	if (prealloc > size || !IS_ALIGNED(prealloc, PAGE_SIZE)) {
+		pr_err("virtio-gpu: guest-alloc pool: invalid prealloc %#llx for size %#llx\n",
+		       prealloc, size);
+		return -EINVAL;
+	}
+	if (step && (step < SZ_2M || !is_power_of_2(step) ||
+		     !IS_ALIGNED(step, PAGE_SIZE) || !IS_ALIGNED(size, step) ||
+		     !IS_ALIGNED(prealloc, step))) {
+		pr_err("virtio-gpu: guest-alloc pool: invalid prealloc/step size %#llx/%#llx\n",
+		       prealloc, step);
+		return -EINVAL;
+	}
+	if (!step && prealloc != size) {
+		pr_err("virtio-gpu: guest-alloc pool: partial prealloc requires a non-zero step\n");
+		return -EINVAL;
+	}
 
 	mutex_init(&vgdev->guest_pool_lock);
 	ret = drm_buddy_init(&vgdev->guest_pool_mm, size, PAGE_SIZE);
@@ -430,18 +531,38 @@ int virtio_gpu_guest_pool_init(struct virtio_gpu_device *vgdev)
 
 	vgdev->gpu_guest_pool_base = base;
 	vgdev->gpu_guest_pool_size = size;
-	pr_info("virtio-gpu: guest-alloc pool: base %pa size %llu MiB (drm_buddy, %u roots, max order %u)\n",
+	vgdev->gpu_guest_pool_id = pool_id;
+	vgdev->gpu_guest_pool_prealloc = prealloc;
+	vgdev->gpu_guest_pool_backed = prealloc;
+	vgdev->gpu_guest_pool_step = step;
+	pr_info("virtio-gpu: guest-alloc pool: base %pa size %llu MiB prealloc %llu MiB step %llu MiB id %u (drm_buddy, %u roots, max order %u)\n",
 		&vgdev->gpu_guest_pool_base, size >> 20,
+		prealloc >> 20, step >> 20, pool_id,
 		vgdev->guest_pool_mm.n_roots, vgdev->guest_pool_mm.max_order);
 	return 0;
 }
 
 void virtio_gpu_guest_pool_fini(struct virtio_gpu_device *vgdev)
 {
+	cancel_delayed_work_sync(&vgdev->guest_pool_reclaim_work);
+	if (!READ_ONCE(vgdev->guest_pool_ready))
+		return;
+
+	/* Serialize with alloc/free and close the gate before destroying the buddy tree. Late
+	 * RESOURCE_UNREF callbacks may still arrive after virtio_reset_device(); their release path
+	 * must see the closed gate and leave its block list untouched rather than dereferencing a dead
+	 * allocator. */
+	mutex_lock(&vgdev->guest_pool_lock);
 	if (vgdev->guest_pool_ready) {
-		vgdev->guest_pool_ready = false;
+		u64 live = vgdev->guest_pool_mm.size - vgdev->guest_pool_mm.avail;
+
+		WRITE_ONCE(vgdev->guest_pool_ready, false);
+		if (live)
+			pr_warn("virtio-gpu: guest-alloc pool teardown with %llu bytes still allocated\n",
+				live);
 		drm_buddy_fini(&vgdev->guest_pool_mm);
 	}
+	mutex_unlock(&vgdev->guest_pool_lock);
 }
 
 /* Carve `size` bytes out of the pool as a list of blocks.
@@ -479,10 +600,12 @@ int virtio_gpu_guest_pool_alloc(struct virtio_gpu_device *vgdev, u64 size,
 {
 	int max_nents = READ_ONCE(guest_pool_max_nents);
 	u64 min_bs = PAGE_SIZE;
-	int ret;
+	u64 request_size;
+	bool retry_reclaim = false;
+	int ret = -ENOMEM;
 
 	INIT_LIST_HEAD(blocks);
-	if (!vgdev->guest_pool_ready || !size)
+	if (!READ_ONCE(vgdev->guest_pool_ready) || !size)
 		return -ENOMEM;
 
 	size = ALIGN(size, PAGE_SIZE);
@@ -505,24 +628,184 @@ int virtio_gpu_guest_pool_alloc(struct virtio_gpu_device *vgdev, u64 size,
 		 * above it. */
 		size = ALIGN(size, min_bs);
 	}
+	request_size = size;
+	if (request_size > vgdev->gpu_guest_pool_size)
+		return -ENOMEM;
 
 	mutex_lock(&vgdev->guest_pool_lock);
-	ret = drm_buddy_alloc_blocks(&vgdev->guest_pool_mm, 0,
-				     vgdev->guest_pool_mm.size, size, min_bs,
-				     blocks, 0);
+	if (!vgdev->guest_pool_ready) {
+		mutex_unlock(&vgdev->guest_pool_lock);
+		return -ENODEV;
+	}
+	for (;;) {
+		/* Do not even ask drm_buddy to inspect the ungranted suffix. A read from an
+		 * ungranted protected-VM address is silently zero rather than a recoverable fault. */
+		ret = 0;
+		while (vgdev->gpu_guest_pool_backed < request_size) {
+			if (!vgdev->gpu_guest_pool_step) {
+				ret = -ENOMEM;
+				break;
+			}
+			ret = virtio_gpu_guest_pool_grow_one_locked(vgdev);
+			if (ret)
+				break;
+		}
+		if (ret)
+			break;
+
+		ret = drm_buddy_alloc_blocks(&vgdev->guest_pool_mm, 0,
+					     vgdev->gpu_guest_pool_backed, size, min_bs,
+					     blocks, DRM_BUDDY_RANGE_ALLOCATION);
+		if (!ret || ret != -ENOSPC ||
+		    !vgdev->gpu_guest_pool_step ||
+		    vgdev->gpu_guest_pool_backed >= vgdev->gpu_guest_pool_size)
+			break;
+
+		/* Fragmentation can make the currently backed prefix fail even though the
+		 * full pool has room. Add one suffix step and retry in the same lock. */
+		ret = virtio_gpu_guest_pool_grow_one_locked(vgdev);
+		if (ret)
+			break;
+	}
+	/* A failed allocation may have grown one or more otherwise-unused suffix steps. Return
+	 * those steps immediately instead of making an OOM attempt permanently raise the floor. */
+	if (ret)
+		retry_reclaim = virtio_gpu_guest_pool_reclaim_locked(vgdev);
 	mutex_unlock(&vgdev->guest_pool_lock);
+	if (retry_reclaim)
+		schedule_delayed_work(&vgdev->guest_pool_reclaim_work,
+				      msecs_to_jiffies(100));
 
 	return ret;
 }
 
+static int virtio_gpu_guest_pool_shrink_one_locked(struct virtio_gpu_device *vgdev)
+{
+	u64 offset;
+	bool range_backed = true;
+	int ret;
+
+	if (!vgdev->gpu_guest_pool_step ||
+	    vgdev->gpu_guest_pool_backed <= vgdev->gpu_guest_pool_prealloc)
+		return -ENOSPC;
+
+	offset = vgdev->gpu_guest_pool_backed - vgdev->gpu_guest_pool_step;
+	ret = gunyah_pool_shrink(vgdev->gpu_guest_pool_id, offset,
+				 vgdev->gpu_guest_pool_step);
+	if (ret) {
+		/* A timeout does not say whether the host completed the reclaim. Query the
+		 * exact range before deciding whether it is safe to lower our boundary. */
+		int query_ret = gunyah_pool_query_range(
+			vgdev->gpu_guest_pool_id, offset,
+			vgdev->gpu_guest_pool_step, &range_backed);
+		if (!query_ret && !range_backed)
+			ret = 0;
+	}
+	if (ret == -EUCLEAN) {
+		/* The host kept the grant for retry, but could not restore this guest mapping after
+		 * releasing it. Keep only the already-safe prefix and permanently stop growing this
+		 * pool. Leaking the host grant is preferable to touching an unmapped suffix. */
+		pr_err("virtio-gpu: guest-alloc pool: host/guest mapping recovery failed at %#llx; disabling further growth\n",
+		       offset);
+		vgdev->gpu_guest_pool_backed = offset;
+		vgdev->gpu_guest_pool_step = 0;
+		return 0;
+	}
+	if (!ret)
+		vgdev->gpu_guest_pool_backed = offset;
+	return ret;
+}
+
+/* Probe one suffix step by allocating and immediately freeing the exact range. The buddy tree
+ * remains unchanged, but this tells us whether any live BO block overlaps the step. */
+static bool virtio_gpu_guest_pool_step_free_locked(struct virtio_gpu_device *vgdev)
+{
+	LIST_HEAD(probe);
+	u64 offset;
+
+	if (!vgdev->gpu_guest_pool_step ||
+	    vgdev->gpu_guest_pool_backed <= vgdev->gpu_guest_pool_prealloc)
+		return false;
+
+	offset = vgdev->gpu_guest_pool_backed - vgdev->gpu_guest_pool_step;
+	if (drm_buddy_alloc_blocks(&vgdev->guest_pool_mm, offset,
+				   offset + vgdev->gpu_guest_pool_step,
+				   vgdev->gpu_guest_pool_step,
+				   vgdev->gpu_guest_pool_step, &probe,
+				   DRM_BUDDY_RANGE_ALLOCATION))
+		return false;
+
+	droidvm_drm_buddy_free_list(&vgdev->guest_pool_mm, &probe);
+	return true;
+}
+
+static bool virtio_gpu_guest_pool_reclaim_locked(struct virtio_gpu_device *vgdev)
+{
+	int ret;
+
+	while (virtio_gpu_guest_pool_step_free_locked(vgdev)) {
+		ret = virtio_gpu_guest_pool_shrink_one_locked(vgdev);
+		if (!ret)
+			continue;
+
+		/* EIO is retryable when the host restored the mapping after a failed punch;
+		 * EUCLEAN is deliberately handled by shrink_one_locked as a terminal state. */
+		if (ret == -EBUSY || ret == -ETIMEDOUT || ret == -EIO)
+			return true;
+		pr_warn_ratelimited("virtio-gpu: guest-alloc pool shrink failed: %d\n", ret);
+		break;
+	}
+	return false;
+}
+
+static void virtio_gpu_guest_pool_reclaim_work(struct work_struct *work)
+{
+	struct virtio_gpu_device *vgdev = container_of(
+		to_delayed_work(work), struct virtio_gpu_device, guest_pool_reclaim_work);
+	bool retry = false;
+
+	mutex_lock(&vgdev->guest_pool_lock);
+	if (vgdev->guest_pool_ready)
+		retry = virtio_gpu_guest_pool_reclaim_locked(vgdev);
+	mutex_unlock(&vgdev->guest_pool_lock);
+
+	if (retry)
+		schedule_delayed_work(&vgdev->guest_pool_reclaim_work,
+				      msecs_to_jiffies(100));
+}
+
 void virtio_gpu_guest_pool_free(struct virtio_gpu_device *vgdev, struct list_head *blocks)
 {
-	if (!vgdev->guest_pool_ready || list_empty(blocks))
+	bool retry;
+
+	if (!READ_ONCE(vgdev->guest_pool_ready) || list_empty(blocks))
 		return;
 
 	mutex_lock(&vgdev->guest_pool_lock);
-	drm_buddy_free_list(&vgdev->guest_pool_mm, blocks, 0);
+	if (!vgdev->guest_pool_ready) {
+		mutex_unlock(&vgdev->guest_pool_lock);
+		return;
+	}
+	droidvm_drm_buddy_free_list(&vgdev->guest_pool_mm, blocks);
+	retry = virtio_gpu_guest_pool_reclaim_locked(vgdev);
 	mutex_unlock(&vgdev->guest_pool_lock);
+	if (retry)
+		schedule_delayed_work(&vgdev->guest_pool_reclaim_work,
+			      msecs_to_jiffies(100));
+}
+
+void virtio_gpu_guest_pool_release_object(struct virtio_gpu_device *vgdev,
+					  struct virtio_gpu_object *bo)
+{
+	struct virtio_gpu_object_vram *vram;
+
+	if (!virtio_gpu_is_vram(bo))
+		return;
+	vram = to_virtio_gpu_vram(bo);
+	if (!vram->guest_pool_owned)
+		return;
+	vram->guest_pool_owned = false;
+	virtio_gpu_guest_pool_free(vgdev, &vram->guest_pool_blocks);
 }
 
 /* Pool occupancy, for the VK_EXT_memory_budget figures the guest ICD reports.
@@ -540,13 +823,15 @@ void virtio_gpu_guest_pool_stats(struct virtio_gpu_device *vgdev, u64 *total_byt
 	*used_bytes = 0;
 	*largest_free_bytes = 0;
 
-	if (!vgdev->guest_pool_ready)
+	if (!READ_ONCE(vgdev->guest_pool_ready))
 		return;
 
 	mutex_lock(&vgdev->guest_pool_lock);
-	*total_bytes = vgdev->guest_pool_mm.size;
-	*used_bytes = vgdev->guest_pool_mm.size - vgdev->guest_pool_mm.avail;
-	*largest_free_bytes = vgdev->guest_pool_mm.avail;
+	if (vgdev->guest_pool_ready) {
+		*total_bytes = vgdev->guest_pool_mm.size;
+		*used_bytes = vgdev->guest_pool_mm.size - vgdev->guest_pool_mm.avail;
+		*largest_free_bytes = vgdev->guest_pool_mm.avail;
+	}
 	mutex_unlock(&vgdev->guest_pool_lock);
 }
 
