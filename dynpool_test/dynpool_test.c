@@ -58,6 +58,27 @@ static u64 pool_base, pool_size, pool_prealloc, pool_step;
 static u32 pool_id;
 static struct kobject *dp_kobj;
 
+/* All droidvm,dynamic-pool nodes, so the two-pool / hole-in-the-middle case can be
+ * driven from one module. `select <pool_id>` repoints the globals above at one of these. */
+#define DP_MAX_POOLS 4
+struct dp_pool {
+	u64 base, size, prealloc, step;
+	u32 id;
+};
+static struct dp_pool dp_pools[DP_MAX_POOLS];
+static int dp_npools;
+
+static void dp_activate(int idx)
+{
+	if (idx < 0 || idx >= dp_npools)
+		return;
+	pool_base = dp_pools[idx].base;
+	pool_size = dp_pools[idx].size;
+	pool_prealloc = dp_pools[idx].prealloc;
+	pool_step = dp_pools[idx].step;
+	pool_id = dp_pools[idx].id;
+}
+
 /* Last result, read back through sysfs. */
 static char result[4096];
 static size_t result_len;
@@ -283,7 +304,19 @@ static ssize_t cmd_store(struct kobject *k, struct kobj_attribute *a,
 		goto out;
 	}
 
-	if (!strcmp(verb, "selftest")) {
+	if (!strcmp(verb, "select") && n >= 2) {
+		int i, hit = -1;
+		for (i = 0; i < dp_npools; i++)
+			if (dp_pools[i].id == (u32)a_mb)
+				hit = i;
+		if (hit < 0) {
+			say("no pool with id %llu (have %d pools)\n", a_mb, dp_npools);
+		} else {
+			dp_activate(hit);
+			say("selected pool_id %u (base %#llx, %llu MB, pre %llu MB, step %llu MB)\n",
+			    pool_id, pool_base, pool_size / MB, pool_prealloc / MB, pool_step / MB);
+		}
+	} else if (!strcmp(verb, "selftest")) {
 		test_selftest();
 	} else if (!strcmp(verb, "reject")) {
 		test_rejections();
@@ -347,27 +380,33 @@ static int __init dp_init(void)
 	struct resource res;
 	int ret;
 
-	np = of_find_compatible_node(NULL, NULL, "droidvm,dynamic-pool");
-	if (!np) {
+	/* Collect EVERY dynamic-pool node so both a two-pool layout and a single pool work. */
+	np = NULL;
+	for_each_compatible_node(np, NULL, "droidvm,dynamic-pool") {
+		struct dp_pool *dp;
+
+		if (dp_npools >= DP_MAX_POOLS)
+			break;
+		if (of_address_to_resource(np, 0, &res))
+			continue;
+		dp = &dp_pools[dp_npools];
+		dp->base = res.start;
+		dp->size = resource_size(&res);
+		/* Absent means "fully pre-shared": a pool that does not say how much to hold back
+		 * is an ordinary non-growable one. */
+		if (of_property_read_u64(np, "droidvm,pre-alloc-size", &dp->prealloc))
+			dp->prealloc = dp->size;
+		if (of_property_read_u64(np, "droidvm,step-size", &dp->step))
+			dp->step = 0;
+		if (of_property_read_u32(np, "droidvm,pool-id", &dp->id))
+			dp->id = 0;
+		dp_npools++;
+	}
+	if (dp_npools == 0) {
 		pr_info("dynpool_test: no droidvm,dynamic-pool node; nothing to test\n");
 		return -ENODEV;
 	}
-	ret = of_address_to_resource(np, 0, &res);
-	if (ret) {
-		of_node_put(np);
-		return ret;
-	}
-	pool_base = res.start;
-	pool_size = resource_size(&res);
-	/* Absent means "fully pre-shared", matching the host's own default: a pool that does not
-	 * say how much to hold back is an ordinary non-growable one. */
-	if (of_property_read_u64(np, "droidvm,pre-alloc-size", &pool_prealloc))
-		pool_prealloc = pool_size;
-	if (of_property_read_u64(np, "droidvm,step-size", &pool_step))
-		pool_step = 0;
-	if (of_property_read_u32(np, "droidvm,pool-id", &pool_id))
-		pool_id = 0;
-	of_node_put(np);
+	dp_activate(0);
 
 	if (!gunyah_guest_available())
 		pr_warn("dynpool_test: RM not available; grow/shrink will fail\n");
@@ -381,8 +420,8 @@ static int __init dp_init(void)
 		return ret;
 	}
 
-	pr_info("dynpool_test: pool %u at %#llx, %llu MB (%llu MB pre-shared, step %llu MB)\n",
-		pool_id, pool_base, pool_size / MB, pool_prealloc / MB, pool_step / MB);
+	pr_info("dynpool_test: %d pool(s); active pool %u at %#llx, %llu MB (%llu MB pre-shared, step %llu MB)\n",
+		dp_npools, pool_id, pool_base, pool_size / MB, pool_prealloc / MB, pool_step / MB);
 	return 0;
 }
 
