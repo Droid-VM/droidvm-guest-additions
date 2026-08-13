@@ -65,6 +65,20 @@ EXPORT_SYMBOL_GPL(virtio_gpu_droidvm_trace);
 MODULE_PARM_DESC(droidvm_trace, "Trace each DroidVM blob allocation (default off)");
 module_param_named(droidvm_trace, virtio_gpu_droidvm_trace, bool, 0644);
 
+/*
+ * fbdev emulation is OFF by default on this route.  The fbdev client's restore path
+ * (drm_release -> drm_client_dev_restore -> __drm_fb_helper_restore_fbdev_mode_unlocked)
+ * NULL-derefs when a DRM client exits with the primary plane in the state our guest-blob
+ * scanout leaves it in -- an oops in the task-exit path ("Fixing recursive fault but reboot
+ * is needed!") that half-kills the guest: every subsequent shutdown then hangs before
+ * SYSTEM_OFF and the VM can only be crosvm-stop'ed from outside.  A desktop VM needs no
+ * fbcon (the serial console serves that role), so the client is simply not registered
+ * unless explicitly requested with virtio_gpu.fbdev=1.
+ */
+static bool virtio_gpu_fbdev; /* false */
+MODULE_PARM_DESC(fbdev, "Register the fbdev emulation client (default off; see comment)");
+module_param_named(fbdev, virtio_gpu_fbdev, bool, 0400);
+
 static int virtio_gpu_pci_quirk(struct drm_device *dev)
 {
 	struct pci_dev *pdev = to_pci_dev(dev->dev);
@@ -121,7 +135,8 @@ static int virtio_gpu_probe(struct virtio_device *vdev)
 	if (ret)
 		goto err_deinit;
 
-	drm_client_setup(vdev->priv, NULL);
+	if (virtio_gpu_fbdev)
+		drm_client_setup(vdev->priv, NULL);
 
 	return 0;
 
