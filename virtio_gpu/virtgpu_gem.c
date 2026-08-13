@@ -48,7 +48,6 @@ static int virtio_gpu_gem_create(struct drm_file *file,
 		drm_gem_object_release(&obj->base.base);
 		return ret;
 	}
-
 	*obj_p = &obj->base.base;
 
 	/* drop reference from allocate - handle holds it now */
