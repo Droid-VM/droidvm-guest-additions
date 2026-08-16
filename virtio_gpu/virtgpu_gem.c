@@ -138,6 +138,15 @@ void virtio_gpu_gem_object_close(struct drm_gem_object *obj,
 	if (!vgdev->has_virgl_3d)
 		return;
 
+	/* Mirror virtio_gpu_gem_object_open(): with CONTEXT_INIT the host
+	 * context is only created by an explicit ioctl, and objects opened on a
+	 * file that never created one were never attached. Sending a detach for
+	 * them makes the host answer ERR_UNSPEC (crosvm: InvalidContextId), which
+	 * this driver then logs as "*ERROR* response 0x1200 (command 0x203)" for
+	 * every dumb/KMS-only client at boot and on every process exit. */
+	if (!vfpriv->context_created)
+		return;
+
 	objs = virtio_gpu_array_alloc(1);
 	if (!objs)
 		return;
