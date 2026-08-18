@@ -464,9 +464,19 @@ int virtio_gpu_guest_pool_init(struct virtio_gpu_device *vgdev)
 			continue;
 		if (of_address_to_resource(child, 0, &res) == 0) {
 			base = res.start;
-			size = resource_size(&res);
+			/*
+			 * `reg` covers the pre-shared floor, not the whole window: the Gunyah
+			 * resource manager on android14-6.1 refuses to start a VM whose
+			 * reserved-memory node describes a range no memparcel matches, and only
+			 * the floor is a memparcel before boot. The window's real size therefore
+			 * arrives beside it. A pool that is fully pre-shared omits the property
+			 * because for it the floor IS the window, which is also what every DT
+			 * built before this existed looks like.
+			 */
+			if (of_property_read_u64(child, "droidvm,pool-size", &size))
+				size = resource_size(&res);
 			if (of_property_read_u64(child, "droidvm,pre-alloc-size", &prealloc))
-				prealloc = size;
+				prealloc = resource_size(&res);
 			of_property_read_u64(child, "droidvm,step-size", &step);
 			of_property_read_u32(child, "droidvm,pool-id", &pool_id);
 			of_node_put(child);
@@ -509,8 +519,12 @@ int virtio_gpu_guest_pool_init(struct virtio_gpu_device *vgdev)
 		       prealloc, size);
 		return -EINVAL;
 	}
-	if (step && (step < SZ_2M || !is_power_of_2(step) ||
-		     !IS_ALIGNED(step, PAGE_SIZE) || !IS_ALIGNED(size, step) ||
+	/*
+	 * A step is a multiple of a 2 MiB folio, which is what the host shares a grant in -- not a
+	 * power of two. drm_buddy never sees it: this pool is initialised with PAGE_SIZE as its
+	 * chunk (below), so the allocator has no opinion about the grant granularity at all.
+	 */
+	if (step && (step % SZ_2M || !IS_ALIGNED(size, step) ||
 		     !IS_ALIGNED(prealloc, step))) {
 		pr_err("virtio-gpu: guest-alloc pool: invalid prealloc/step size %#llx/%#llx\n",
 		       prealloc, step);

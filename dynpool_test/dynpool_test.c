@@ -391,11 +391,16 @@ static int __init dp_init(void)
 			continue;
 		dp = &dp_pools[dp_npools];
 		dp->base = res.start;
-		dp->size = resource_size(&res);
+		/* `reg` is the pre-shared floor, not the window: android14-6.1's resource manager
+		 * refuses a VM whose reserved-memory node describes a range no memparcel matches,
+		 * and before boot only the floor is one. The window's size comes alongside; a pool
+		 * that is fully pre-shared omits it, because there the floor is the window. */
+		if (of_property_read_u64(np, "droidvm,pool-size", &dp->size))
+			dp->size = resource_size(&res);
 		/* Absent means "fully pre-shared": a pool that does not say how much to hold back
 		 * is an ordinary non-growable one. */
 		if (of_property_read_u64(np, "droidvm,pre-alloc-size", &dp->prealloc))
-			dp->prealloc = dp->size;
+			dp->prealloc = resource_size(&res);
 		if (of_property_read_u64(np, "droidvm,step-size", &dp->step))
 			dp->step = 0;
 		if (of_property_read_u32(np, "droidvm,pool-id", &dp->id))
