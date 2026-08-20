@@ -66,7 +66,36 @@ ga_check_blacklist() {
 	fi
 }
 
+# Give the desktop users access to the render node.
+#
+# /dev/dri/renderD128 is root:render 0660, and this appliance's compositor opens it directly:
+# without membership kwin logs "Failed to open drm device /dev/dri/renderD128", fails to apply any
+# output configuration, and exits -- sddm restarts it forever, so the guest has a running session
+# with no screen at all, and every restart burns another host GPU context. logind's uaccess ACL is
+# not a substitute here: it is granted only while a seat session is active, and the compositor
+# needs the node before that is settled. Both groups are created by udev's own rules
+# (50-udev-default.rules), so this only adds membership; a user already in them is left alone.
+ga_add_render_groups() {
+	command -v usermod >/dev/null 2>&1 || return 0
+	# Human accounts only: uid >= 1000 and below the nobody sentinel.
+	getent passwd | awk -F: '$3 >= 1000 && $3 < 65534 { print $1 }' | while read -r u; do
+		for g in render video; do
+			getent group "$g" >/dev/null 2>&1 || continue
+			id -nG "$u" 2>/dev/null | tr ' ' '\n' | grep -qx "$g" && continue
+			usermod -aG "$g" "$u" 2>/dev/null && ga_msg "added $u to the $g group (takes effect at next login)"
+		done
+	done
+	# Never let this fail the install. hooks.sh runs under `set -e`, this is the FIRST thing
+	# ga_install does, and the loop's last statement is an AND-list: one usermod that cannot
+	# touch an account -- an LDAP/SSSD/NIS entry that getent enumerates and usermod does not
+	# own -- would abort the postinst before dkms ever ran. A failed apt transaction leaves a
+	# broken system with no package to remove, which is the one outcome worth avoiding here.
+	return 0
+}
+
 ga_install() {
+	ga_add_render_groups
+
 	# Idempotent: a reinstall or a failed previous attempt must not wedge the tree.
 	if dkms status -m "$PKG" -v "$VER" 2>/dev/null | grep -q .; then
 		dkms remove -m "$PKG" -v "$VER" --all >/dev/null 2>&1 || true
