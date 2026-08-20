@@ -34,8 +34,21 @@
 
 #include "virtgpu_drv.h"
 
+/*
+ * What the primary plane will scan out. This has to be the same set virtio_gpu_fb_create()
+ * accepts, and it was not: fb_create takes ABGR8888, ARGB8888 and XRGB8888, while the plane
+ * advertised only the first. DRM checks the *plane's* list when a modeset arrives, so a
+ * compositor that picked XRGB8888 got "format XR24 little-endian not supported" from
+ * drm_plane_check_pixel_format(), then "No compatible format found", and the modeset failed with
+ * EINVAL -- kwin logged "Modeset failed! Invalid argument" and gave up with no usable output at
+ * all. Mesa 26.3's zink/kwin path picks XRGB8888 for scanout where 26.0.3 did not, which is why
+ * this only surfaced after the guest mesa uprev. All three are handled by
+ * virtio_gpu_translate_format() below.
+ */
 static const uint32_t virtio_gpu_formats[] = {
 	VIRTIO_GPU_PRIMARY_FORMAT,
+	DRM_FORMAT_HOST_ARGB8888,
+	DRM_FORMAT_HOST_XRGB8888,
 };
 
 static const uint32_t virtio_gpu_cursor_formats[] = {
