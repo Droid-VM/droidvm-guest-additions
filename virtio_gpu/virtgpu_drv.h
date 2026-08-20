@@ -339,9 +339,6 @@ struct virtio_gpu_device {
 	bool has_create_guest_handle;
 	struct virtio_shm_region host_visible_region;
 	struct drm_mm host_visible_mm;
-	/* Gunyah: permanent guard so no blob is shared at the BAR base gpa,
-	 * which the RM rejects (mem_share EINVAL at offset 0). */
-	struct drm_mm_node host_visible_guard;
 	/* DroidVM gfxstream pre-alloc: guest physical base of the boot-blessed GpuPool
 	 * (from the /reserved-memory "gfx_host" DT node), or 0 if absent. A
 	 * pool-resident blob maps gpu_pool_base + pool_offset directly. */

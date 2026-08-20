@@ -256,20 +256,23 @@ int virtio_gpu_init(struct virtio_device *vdev, struct drm_device *dev)
 			    (unsigned long)vgdev->host_visible_region.len);
 
 		/*
-		 * Gunyah: the host RM rejects mem_share for a blob landing exactly
-		 * at the host-visible BAR base (gpa == host_visible_region.addr ->
-		 * mem_share EINVAL, seen as repeated RESOURCE_MAP_BLOB failures and
-		 * "Failed to create virtgpu AddressSpaceStream"). Permanently reserve
-		 * the first 2MiB so drm_mm never allocates that gpa to any blob.
+		 * There used to be a permanent 2 MiB reservation at the base of this
+		 * range, on the theory that the Gunyah RM refuses a mem_share for a
+		 * blob landing exactly at the BAR base. That theory was wrong:
+		 * gh_rm_mem_share() carries no IPA at all (only the ACL, the label and
+		 * the host's mem entries), so the BAR base cannot be visible to it. It
+		 * was tested directly with a GPU-free probe (crosvm GH_SHARE_PROBE
+		 * shares a scratch page at a chosen gpa; a small guest module calls
+		 * gunyah_guest_mem_accept() on it and reads back the host's pattern):
+		 * gpa == host_visible_region.addr (0x200000000) shared cleanly on both
+		 * the 6.12 and the 6.1.118 RM, and on 6.12 the guest also accepted it
+		 * and read back the host's pattern -- exactly like the two control gpas
+		 * above it. The whole range is usable.
+		 *
+		 * Note this is unrelated to the per-blob 2 MiB alignment in
+		 * virtio_gpu_vram_map(): that one is about one hugepage folio holding at
+		 * most one live parcel, not about the base of the range.
 		 */
-		memset(&vgdev->host_visible_guard, 0,
-		       sizeof(vgdev->host_visible_guard));
-		vgdev->host_visible_guard.start =
-			(unsigned long)vgdev->host_visible_region.addr;
-		vgdev->host_visible_guard.size = 0x200000;
-		if (drm_mm_reserve_node(&vgdev->host_visible_mm,
-					&vgdev->host_visible_guard))
-			DRM_ERROR("Could not reserve host-visible BAR-base guard\n");
 	}
 
 	if (virtio_has_feature(vgdev->vdev, VIRTIO_GPU_F_CONTEXT_INIT))
@@ -398,11 +401,8 @@ void virtio_gpu_release(struct drm_device *dev)
 	virtio_gpu_cleanup_cap_cache(vgdev);
 	virtio_gpu_guest_pool_fini(vgdev);
 
-	if (vgdev->has_host_visible) {
-		if (drm_mm_node_allocated(&vgdev->host_visible_guard))
-			drm_mm_remove_node(&vgdev->host_visible_guard);
+	if (vgdev->has_host_visible)
 		drm_mm_takedown(&vgdev->host_visible_mm);
-	}
 }
 
 int virtio_gpu_driver_open(struct drm_device *dev, struct drm_file *file)
