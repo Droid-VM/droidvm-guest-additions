@@ -444,6 +444,13 @@ struct virtio_gpu_resource_map_blob {
 #define VIRTIO_GPU_MAP_CACHE_CACHED   0x01
 #define VIRTIO_GPU_MAP_CACHE_UNCACHED 0x02
 #define VIRTIO_GPU_MAP_CACHE_WC       0x03
+/*
+ * DroidVM gfxstream pre-alloc: set in map_info when the host-visible blob lives in the
+ * boot-blessed GpuPool. The `gunyah_handle` field then carries the pool BYTE OFFSET (not a
+ * memparcel handle); the guest maps gpu_pool_base + offset out of its already-accepted RAM and
+ * skips gunyah accept. The low bits still carry the cache attribute (mask before comparing).
+ */
+#define VIRTIO_GPU_MAP_INFO_POOL      (1u << 31)
 struct virtio_gpu_resp_map_info {
 	struct virtio_gpu_ctrl_hdr hdr;
 	__u32 map_info;

@@ -31,7 +31,54 @@
 #include <drm/drm_managed.h>
 #include <drm/drm_print.h>
 
+#include <linux/of.h>
+#include <linux/of_address.h>
+
 #include "virtgpu_drv.h"
+
+/*
+ * DroidVM gfxstream pre-alloc: find the boot-blessed GpuPool base GPA from the
+ * /reserved-memory "gfx_host@<gpa>" node crosvm emits (no-map, matched by the
+ * Gunyah RM to the SHARE'd pool region). Returns 0 if not present (pre-alloc off).
+ */
+/*
+ * The host-owned pool a pool-resident blob's map_blob offset is relative to.
+ *
+ * Which node holds it depends on the renderer, so the names are added by the
+ * routes that publish them; a VM runs one renderer, so at most one is present and
+ * the guest does not need to know which it got -- VIRTIO_GPU_MAP_INFO_POOL means
+ * "gpu_pool_base + the offset in this response" either way.
+ */
+static phys_addr_t virtio_gpu_find_pool_base_named(const char *prefix)
+{
+	struct device_node *rmem, *child;
+	phys_addr_t base = 0;
+
+	rmem = of_find_node_by_path("/reserved-memory");
+	if (!rmem)
+		return 0;
+	for_each_child_of_node(rmem, child) {
+		struct resource res;
+
+		if (!of_node_name_prefix(child, prefix))
+			continue;
+		if (of_address_to_resource(child, 0, &res) == 0) {
+			base = res.start;
+			of_node_put(child);
+			break;
+		}
+	}
+	of_node_put(rmem);
+	return base;
+}
+
+static phys_addr_t virtio_gpu_find_pool_base(const char **which)
+{
+	phys_addr_t base = 0;
+
+	*which = NULL;
+	return base;
+}
 
 static void virtio_gpu_config_changed_work_func(struct work_struct *work)
 {
@@ -125,6 +172,7 @@ int virtio_gpu_init(struct virtio_device *vdev, struct drm_device *dev)
 	/* this will expand later */
 	struct virtqueue *vqs[2];
 	u32 num_scanouts, num_capsets;
+	const char *pool_node;
 	int ret = 0;
 
 	if (!virtio_has_feature(vdev, VIRTIO_F_VERSION_1))
@@ -217,6 +265,13 @@ int virtio_gpu_init(struct virtio_device *vdev, struct drm_device *dev)
 	if (virtio_has_feature(vgdev->vdev, VIRTIO_GPU_F_CONTEXT_INIT))
 		vgdev->has_context_init = true;
 
+	/* Name the node it came from. The two renderers share this path, so a message that
+	 * named one of them was wrong half the time -- and this line is what a bringup checks
+	 * to see whether the host pool bound at all. */
+	vgdev->gpu_pool_base = virtio_gpu_find_pool_base(&pool_node);
+	if (vgdev->gpu_pool_base)
+		DRM_INFO("host pool: %s base %pa\n", pool_node, &vgdev->gpu_pool_base);
+
 	DRM_INFO("features: %cvirgl %cedid %cresource_blob %chost_visible",
 		 vgdev->has_virgl_3d    ? '+' : '-',
 		 vgdev->has_edid        ? '+' : '-',
@@ -276,6 +331,7 @@ int virtio_gpu_init(struct virtio_device *vdev, struct drm_device *dev)
 		wait_event_timeout(vgdev->resp_wq, !vgdev->display_info_pending,
 				   5 * HZ);
 	}
+
 	return 0;
 
 err_scanouts:

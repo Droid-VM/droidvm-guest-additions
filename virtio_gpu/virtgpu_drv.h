@@ -31,6 +31,15 @@
 #include <linux/virtio_ids.h>
 #include <linux/virtio_config.h>
 #include <linux/virtio_gpu.h>
+/*
+ * DroidVM gfxstream pre-alloc: the build uses the kernel's <linux/virtio_gpu.h> (not the
+ * vendored uapi copy), so define our map_info flag here where every .c file sees it. Set in
+ * the RESOURCE_MAP_BLOB response's map_info when the blob is GpuPool-resident; the response's
+ * padding field then carries the pool byte offset.
+ */
+#ifndef VIRTIO_GPU_MAP_INFO_POOL
+#define VIRTIO_GPU_MAP_INFO_POOL      (1u << 31)
+#endif
 
 #include <drm/drm_atomic.h>
 #include <drm/drm_drv.h>
@@ -110,6 +119,13 @@ struct virtio_gpu_object_vram {
 	struct virtio_gpu_object base;
 	uint32_t map_state;
 	uint32_t map_info;
+	/*
+	 * DroidVM gfxstream pre-alloc: this blob is GpuPool-resident. Its pages are already in
+	 * the guest stage-2 (pool SHARE-blessed at boot), so mmap io_remaps gpu_pool_base +
+	 * pool_offset with no runtime SHARE at all.
+	 */
+	bool pool_resident;
+	u64 pool_offset;
 	struct drm_mm_node vram_node;
 };
 
@@ -259,6 +275,10 @@ struct virtio_gpu_device {
 	bool has_context_init;
 	struct virtio_shm_region host_visible_region;
 	struct drm_mm host_visible_mm;
+	/* DroidVM gfxstream pre-alloc: guest physical base of the boot-blessed GpuPool
+	 * (from the /reserved-memory "gfx_host" DT node), or 0 if absent. A
+	 * pool-resident blob maps gpu_pool_base + pool_offset directly. */
+	phys_addr_t gpu_pool_base;
 
 	struct work_struct config_changed_work;
 

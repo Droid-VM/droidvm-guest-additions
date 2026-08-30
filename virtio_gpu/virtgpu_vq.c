@@ -1373,7 +1373,20 @@ static void virtio_gpu_cmd_resource_map_cb(struct virtio_gpu_device *vgdev,
 	spin_lock(&vgdev->host_visible_lock);
 
 	if (resp_type == VIRTIO_GPU_RESP_OK_MAP_INFO) {
-		vram->map_info = resp->map_info;
+		uint32_t mi = le32_to_cpu(resp->map_info);
+
+		if (mi & VIRTIO_GPU_MAP_INFO_POOL) {
+			/*
+			 * DroidVM gfxstream pre-alloc: the host sub-allocated this blob from the
+			 * boot-blessed GpuPool, and the spec's padding field carries the pool BYTE
+			 * OFFSET -- map gpu_pool_base + offset directly.
+			 */
+			vram->pool_resident = true;
+			vram->pool_offset = le32_to_cpu(resp->padding);
+			vram->map_info = mi & VIRTIO_GPU_MAP_CACHE_MASK;
+		} else {
+			vram->map_info = mi;
+		}
 		vram->map_state = STATE_OK;
 	} else {
 		vram->map_state = STATE_ERR;

@@ -57,7 +57,8 @@ static int virtio_gpu_vram_mmap(struct drm_gem_object *obj,
 	 * Gunyah: the host SHARE'd this blob and drove the guest-side memparcel accept
 	 * itself, over the virtio-gunyah-accept transport, before the map_blob response
 	 * came back -- so the IPA at vram_node.start is already accessible here and this
-	 * driver needs no memparcel code at all.
+	 * driver needs no memparcel code at all. (gfxstream pre-alloc blobs never even
+	 * SHARE: the pool was blessed at boot.)
 	 */
 
 	vma->vm_pgoff -= drm_vma_node_start(&obj->vma_node);
@@ -76,6 +77,24 @@ static int virtio_gpu_vram_mmap(struct drm_gem_object *obj,
 
 	if (vm_end > vram->vram_node.size)
 		return -EINVAL;
+
+	/*
+	 * gfxstream pre-alloc (host pool): still one run, so remap gpu_pool_base + pool_offset
+	 * instead of the BAR node. The pool is already in the guest stage-2, so no accept was
+	 * needed.
+	 */
+	if (vram->pool_resident) {
+		phys_addr_t pa;
+
+		if (!vgdev->gpu_pool_base) {
+			pr_err("virtio-gpu: pool-resident blob but no pool base in DT\n");
+			return -EINVAL;
+		}
+		pa = vgdev->gpu_pool_base + vram->pool_offset;
+		return io_remap_pfn_range(vma, vma->vm_start,
+					  (pa >> PAGE_SHIFT) + vma->vm_pgoff,
+					  vm_size, vma->vm_page_prot);
+	}
 
 	ret = io_remap_pfn_range(vma, vma->vm_start,
 				 (vram->vram_node.start >> PAGE_SHIFT) + vma->vm_pgoff,
