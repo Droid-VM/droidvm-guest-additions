@@ -44,10 +44,12 @@
 /*
  * The host-owned pool a pool-resident blob's map_blob offset is relative to.
  *
- * Which node holds it depends on the renderer, so the names are added by the
- * routes that publish them; a VM runs one renderer, so at most one is present and
- * the guest does not need to know which it got -- VIRTIO_GPU_MAP_INFO_POOL means
- * "gpu_pool_base + the offset in this response" either way.
+ * Two hosts emit one: gfxstream's host-visible pool as "gfx_host", and
+ * virglrenderer's drm2kgsl native-context arena as "drm2kgsl_host". A VM runs one
+ * renderer or the other, so at most one is present and the guest does not need
+ * to know which it got -- VIRTIO_GPU_MAP_INFO_POOL means "gpu_pool_base + the
+ * offset in this response" either way. gfx_host is checked first so a
+ * host that somehow emitted both keeps the gfxstream meaning.
  */
 static phys_addr_t virtio_gpu_find_pool_base_named(const char *prefix)
 {
@@ -74,9 +76,13 @@ static phys_addr_t virtio_gpu_find_pool_base_named(const char *prefix)
 
 static phys_addr_t virtio_gpu_find_pool_base(const char **which)
 {
-	phys_addr_t base = virtio_gpu_find_pool_base_named("drm2kgsl_host");
+	phys_addr_t base = virtio_gpu_find_pool_base_named("gfx_host");
 
-	*which = "drm2kgsl_host";
+	*which = "gfx_host";
+	if (!base) {
+		base = virtio_gpu_find_pool_base_named("drm2kgsl_host");
+		*which = "drm2kgsl_host";
+	}
 	return base;
 }
 
