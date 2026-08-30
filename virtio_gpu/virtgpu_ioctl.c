@@ -508,8 +508,20 @@ static int virtio_gpu_resource_create_blob_ioctl(struct drm_device *dev,
 	struct drm_virtgpu_resource_create_blob *rc_blob = data;
 
 	if (verify_blob(vgdev, vfpriv, &params, rc_blob,
-			&guest_blob, &host3d_blob))
+			&guest_blob, &host3d_blob)) {
+		pr_err("VGBLOB-DBG: verify_blob FAILED mem=%u flags=0x%x size=%llu cmd_size=%u\n",
+		       rc_blob->blob_mem, rc_blob->blob_flags,
+		       (unsigned long long)rc_blob->size, rc_blob->cmd_size);
 		return -EINVAL;
+	}
+
+	/* Per-blob-create entry trace: demoted from pr_err to pr_debug -- this fired unconditionally on
+	 * every host-visible blob allocation (hundreds per desktop session) and dominated guest dmesg.
+	 * The FAILED paths below stay at pr_err since they only fire on real errors. */
+	pr_debug("VGBLOB-DBG: enter mem=%u flags=0x%x size=%llu cmd_size=%u guest=%d host3d=%d\n",
+	       rc_blob->blob_mem, rc_blob->blob_flags,
+	       (unsigned long long)rc_blob->size, rc_blob->cmd_size,
+	       guest_blob, host3d_blob);
 
 	if (vgdev->has_virgl_3d)
 		virtio_gpu_create_context(dev, file);
@@ -534,8 +546,13 @@ static int virtio_gpu_resource_create_blob_ioctl(struct drm_device *dev,
 	else
 		return -EINVAL;
 
-	if (ret < 0)
+	if (ret < 0) {
+		pr_err("VGBLOB-DBG: create FAILED ret=%d (%s) mem=%u flags=0x%x size=%llu\n",
+		       ret, guest_blob ? "object_create" : "vram_create",
+		       rc_blob->blob_mem, rc_blob->blob_flags,
+		       (unsigned long long)rc_blob->size);
 		return ret;
+	}
 
 	bo->guest_blob = guest_blob;
 	bo->host3d_blob = host3d_blob;
@@ -546,6 +563,9 @@ static int virtio_gpu_resource_create_blob_ioctl(struct drm_device *dev,
 	if (params.blob_flags & VIRTGPU_BLOB_FLAG_USE_CROSS_DEVICE) {
 		ret = virtio_gpu_resource_assign_uuid(vgdev, bo);
 		if (ret) {
+			pr_err("VGBLOB-DBG: assign_uuid FAILED ret=%d flags=0x%x size=%llu\n",
+			       ret, rc_blob->blob_flags,
+			       (unsigned long long)rc_blob->size);
 			drm_gem_object_release(obj);
 			return ret;
 		}
@@ -553,6 +573,9 @@ static int virtio_gpu_resource_create_blob_ioctl(struct drm_device *dev,
 
 	ret = drm_gem_handle_create(file, obj, &handle);
 	if (ret) {
+		pr_err("VGBLOB-DBG: handle_create FAILED ret=%d flags=0x%x size=%llu\n",
+		       ret, rc_blob->blob_flags,
+		       (unsigned long long)rc_blob->size);
 		drm_gem_object_release(obj);
 		return ret;
 	}

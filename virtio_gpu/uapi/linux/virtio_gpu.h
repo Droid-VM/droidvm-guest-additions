@@ -447,7 +447,10 @@ struct virtio_gpu_resource_map_blob {
 struct virtio_gpu_resp_map_info {
 	struct virtio_gpu_ctrl_hdr hdr;
 	__u32 map_info;
-	__u32 padding;
+	/* Was padding. On Gunyah, the resource-manager memparcel handle the guest
+	 * must accept to map the host-visible blob itself; 0 when not applicable.
+	 */
+	__u32 gunyah_handle;
 };
 
 /* VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB */

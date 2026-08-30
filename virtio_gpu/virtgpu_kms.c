@@ -193,6 +193,25 @@ int virtio_gpu_init(struct virtio_device *vdev, struct drm_device *dev)
 		drm_mm_init(&vgdev->host_visible_mm,
 			    (unsigned long)vgdev->host_visible_region.addr,
 			    (unsigned long)vgdev->host_visible_region.len);
+
+		/*
+		 * There used to be a permanent 2 MiB reservation at the base of this
+		 * range, on the theory that the Gunyah RM refuses a mem_share for a
+		 * blob landing exactly at the BAR base. That theory was wrong:
+		 * gh_rm_mem_share() carries no IPA at all (only the ACL, the label and
+		 * the host's mem entries), so the BAR base cannot be visible to it. It
+		 * was tested directly with a GPU-free probe (crosvm GH_SHARE_PROBE
+		 * shares a scratch page at a chosen gpa; a small guest module calls
+		 * gunyah_guest_mem_accept() on it and reads back the host's pattern):
+		 * gpa == host_visible_region.addr (0x200000000) shared cleanly on both
+		 * the 6.12 and the 6.1.118 RM, and on 6.12 the guest also accepted it
+		 * and read back the host's pattern -- exactly like the two control gpas
+		 * above it. The whole range is usable.
+		 *
+		 * Note this is unrelated to the per-blob 2 MiB alignment in
+		 * virtio_gpu_vram_map(): that one is about one hugepage folio holding at
+		 * most one live parcel, not about the base of the range.
+		 */
 	}
 
 	if (virtio_has_feature(vgdev->vdev, VIRTIO_GPU_F_CONTEXT_INIT))

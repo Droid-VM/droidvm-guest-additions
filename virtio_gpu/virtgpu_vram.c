@@ -2,6 +2,7 @@
 #include "virtgpu_drv.h"
 
 #include <linux/dma-mapping.h>
+#include <linux/sizes.h>
 
 static void virtio_gpu_vram_free(struct drm_gem_object *obj)
 {
@@ -15,6 +16,12 @@ static void virtio_gpu_vram_free(struct drm_gem_object *obj)
 		unmap = drm_mm_node_allocated(&vram->vram_node);
 		spin_unlock(&vgdev->host_visible_lock);
 
+		/*
+		 * Gunyah acceptance (and its release-before-unmap ordering, which keeps the
+		 * host from re-SHAREing a reused BAR offset while the guest still maps it)
+		 * is driven host-side over the virtio-gunyah-accept transport, inside the
+		 * unmap below. Nothing to do here.
+		 */
 		if (unmap)
 			virtio_gpu_cmd_unmap(vgdev, bo);
 
@@ -45,6 +52,13 @@ static int virtio_gpu_vram_mmap(struct drm_gem_object *obj,
 	wait_event(vgdev->resp_wq, vram->map_state != STATE_INITIALIZING);
 	if (vram->map_state != STATE_OK)
 		return -EINVAL;
+
+	/*
+	 * Gunyah: the host SHARE'd this blob and drove the guest-side memparcel accept
+	 * itself, over the virtio-gunyah-accept transport, before the map_blob response
+	 * came back -- so the IPA at vram_node.start is already accessible here and this
+	 * driver needs no memparcel code at all.
+	 */
 
 	vma->vm_pgoff -= drm_vma_node_start(&obj->vma_node);
 	vm_flags_set(vma, VM_MIXEDMAP | VM_DONTEXPAND);
@@ -152,9 +166,20 @@ static int virtio_gpu_vram_map(struct virtio_gpu_object *bo)
 	if (!vgdev->has_host_visible)
 		return -EINVAL;
 
+	/*
+	 * host_visible_mm's backing is hugepage-backed by gh_hugepage_reserve's pool: each 2MB
+	 * physical folio can apparently host only ONE live gunyah SHARE/MEM_ACCEPT at a time. A
+	 * plain byte-granular sub-allocator packs unrelated blobs into the same 2MB folio, and
+	 * the second blob's accept then collides with the first's still-live stage-2 mapping of
+	 * that folio and is rejected (MEM_ACCEPT err_code=0x6/0x7) even though it never touches
+	 * the first blob's bytes. Force every blob onto its own dedicated, exclusively-owned 2MB
+	 * folio(s): align the start to 2MB and round the size up to a 2MB multiple so no other
+	 * blob's allocation can ever land in the same folio.
+	 */
 	spin_lock(&vgdev->host_visible_lock);
-	ret = drm_mm_insert_node(&vgdev->host_visible_mm, &vram->vram_node,
-				 bo->base.base.size);
+	ret = drm_mm_insert_node_generic(&vgdev->host_visible_mm, &vram->vram_node,
+					 ALIGN(bo->base.base.size, SZ_2M), SZ_2M, 0,
+					 DRM_MM_INSERT_BEST);
 	spin_unlock(&vgdev->host_visible_lock);
 
 	if (ret)
@@ -206,12 +231,15 @@ int virtio_gpu_vram_create(struct virtio_gpu_device *vgdev,
 	/* Create fake offset */
 	ret = drm_gem_create_mmap_offset(obj);
 	if (ret) {
+		pr_err("VGBLOB-DBG: drm_gem_create_mmap_offset FAILED ret=%d size=%llu\n",
+		       ret, (unsigned long long)params->size);
 		kfree(vram);
 		return ret;
 	}
 
 	ret = virtio_gpu_resource_id_get(vgdev, &vram->base.hw_res_handle);
 	if (ret) {
+		pr_err("VGBLOB-DBG: resource_id_get FAILED ret=%d\n", ret);
 		kfree(vram);
 		return ret;
 	}
@@ -221,6 +249,8 @@ int virtio_gpu_vram_create(struct virtio_gpu_device *vgdev,
 	if (params->blob_flags & VIRTGPU_BLOB_FLAG_USE_MAPPABLE) {
 		ret = virtio_gpu_vram_map(&vram->base);
 		if (ret) {
+			pr_err("VGBLOB-DBG: vram_map FAILED ret=%d size=%llu (host_visible_mm full?)\n",
+			       ret, (unsigned long long)params->size);
 			virtio_gpu_vram_free(obj);
 			return ret;
 		}
