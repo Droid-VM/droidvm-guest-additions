@@ -4,6 +4,7 @@
 #include <linux/bitmap.h>
 #include <linux/dma-mapping.h>
 #include <linux/errno.h>
+#include <linux/log2.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/sizes.h>
@@ -585,9 +586,33 @@ void virtio_gpu_guest_pool_fini(struct virtio_gpu_device *vgdev)
  * genuinely need one physical run (scanout) would pass DRM_BUDDY_CONTIGUOUS_ALLOCATION; none do
  * today.
  */
+/*
+ * Upper bound on the mem-entries one allocation may turn into.
+ *
+ * Every block becomes one entry on the wire and one item in the host's UDMABUF_CREATE_LIST, and
+ * that ioctl has its own ceiling (udmabuf's list_limit, 1024 upstream; the DroidVM udmabuf module
+ * raises it to 8192).  Exceeding it fails in the host with a bare EINVAL, several layers away
+ * from the allocation that caused it.  Bound it here instead, where the number is known and the
+ * message can say so.
+ *
+ * This is not a granularity setting in disguise: min_block_size never goes below PAGE_SIZE, so
+ * small buffers keep page granularity whatever this is set to.  It only lowers the floor for
+ * large ones -- at 65536 a 128 MiB buffer may split at 2 KiB rather than 128 KiB.
+ *
+ * Raising it does not make ordinary allocations more scattered; drm_buddy still hands back the
+ * largest blocks it has, and a healthy pool answers in one. What it changes is the failure mode:
+ * a pool too fragmented to produce large blocks now succeeds with a long list instead of failing.
+ * Set to match the host udmabuf module's list_limit, since that is what has to accept the list.
+ */
+static int guest_pool_max_nents = 65536;
+module_param_named(guest_pool_max_nents, guest_pool_max_nents, int, 0644);
+MODULE_PARM_DESC(guest_pool_max_nents,
+		 "Max blocks one guest-alloc allocation may scatter into (0 = unbounded). Default 65536.");
+
 int virtio_gpu_guest_pool_alloc(struct virtio_gpu_device *vgdev, u64 size,
 				struct list_head *blocks)
 {
+	int max_nents = READ_ONCE(guest_pool_max_nents);
 	u64 min_bs = PAGE_SIZE;
 	u64 request_size;
 	bool retry_reclaim = false;
@@ -599,6 +624,24 @@ int virtio_gpu_guest_pool_alloc(struct virtio_gpu_device *vgdev, u64 size,
 
 	size = ALIGN(size, PAGE_SIZE);
 
+	/*
+	 * drm_buddy hands back blocks of at least min_block_size, so requiring size/max_nents is
+	 * what bounds the count -- no post-hoc rejection needed for the common case.  It costs
+	 * allocation flexibility: a pool too fragmented to produce blocks this large now fails
+	 * here rather than succeeding into a list the host cannot accept.  That is the intended
+	 * trade; the failure carries the pool stats, the host's EINVAL would not.
+	 */
+	if (max_nents > 0) {
+		min_bs = max_t(u64, min_bs,
+			       roundup_pow_of_two(DIV_ROUND_UP_ULL(size, max_nents)));
+		if (min_bs > size)
+			min_bs = rounddown_pow_of_two(size);
+		/* drm_buddy rejects a size that is not a multiple of min_block_size.  The slack
+		 * lands inside the last block, which the BO already tolerates: params->size is
+		 * what goes on the wire, and the buddy allocation has always been page-rounded
+		 * above it. */
+		size = ALIGN(size, min_bs);
+	}
 	request_size = size;
 	if (request_size > vgdev->gpu_guest_pool_size)
 		return -ENOMEM;
@@ -868,6 +911,18 @@ int virtio_gpu_guest_pool_create(struct virtio_gpu_device *vgdev,
 		vgdev->guest_pool_multiblock_seen = true;
 		pr_info("virtio-gpu: guest-alloc: scatter allocation in use (%u blocks for %lu bytes)\n",
 			nents, params->size);
+	}
+
+	/*
+	 * virtio_gpu_guest_pool_alloc() already sizes the blocks so this cannot trip, so reaching
+	 * it means the bound and the allocator disagree -- worth saying out loud rather than
+	 * letting the host reject the list with an errno that names none of this.
+	 */
+	if (guest_pool_max_nents > 0 && nents > guest_pool_max_nents) {
+		pr_err("virtio-gpu: guest-alloc: %u blocks for %lu bytes exceeds guest_pool_max_nents=%d; the host's UDMABUF_CREATE_LIST would reject this\n",
+		       nents, params->size, guest_pool_max_nents);
+		ret = -ENOSPC;
+		goto err_obj;
 	}
 
 	ents = kvmalloc_array(nents, sizeof(*ents), GFP_KERNEL);
