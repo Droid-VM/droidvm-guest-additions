@@ -65,6 +65,18 @@ EXPORT_SYMBOL_GPL(virtio_gpu_droidvm_trace);
 MODULE_PARM_DESC(droidvm_trace, "Trace each DroidVM blob allocation (default off)");
 module_param_named(droidvm_trace, virtio_gpu_droidvm_trace, bool, 0644);
 
+/*
+ * fbdev emulation is ON by default now that fb_create accepts the console's XRGB format
+ * (see virtio_gpu_user_framebuffer_create): the client sets up cleanly, so /dev/fb0 and
+ * VT/fbcon work and fb_helper->funcs is populated -- which also closes the 6.18+ restore-path
+ * NULL-deref that used to hang shutdown. Historically this was forced off because the setup
+ * always failed (-ENOENT on the format) and left that deref armed; keep the switch so a bisect
+ * or a future regression can disable it with virtio_gpu.fbdev=0.
+ */
+static bool virtio_gpu_fbdev = true;
+MODULE_PARM_DESC(fbdev, "Register the fbdev emulation client (default on)");
+module_param_named(fbdev, virtio_gpu_fbdev, bool, 0400);
+
 static int virtio_gpu_pci_quirk(struct drm_device *dev)
 {
 	struct pci_dev *pdev = to_pci_dev(dev->dev);
@@ -121,7 +133,8 @@ static int virtio_gpu_probe(struct virtio_device *vdev)
 	if (ret)
 		goto err_deinit;
 
-	drm_client_setup(vdev->priv, NULL);
+	if (virtio_gpu_fbdev)
+		drm_client_setup(vdev->priv, NULL);
 
 	return 0;
 

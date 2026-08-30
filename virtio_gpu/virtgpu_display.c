@@ -325,8 +325,20 @@ virtio_gpu_user_framebuffer_create(struct drm_device *dev,
 	struct virtio_gpu_framebuffer *virtio_gpu_fb;
 	int ret;
 
+	/*
+	 * The desktop compositors hand us VIRTIO_GPU_PRIMARY_FORMAT (ABGR8888)
+	 * or its alpha sibling. The in-kernel fbdev client is different: it
+	 * builds its framebuffer with drm_driver_legacy_fb_format(), which under
+	 * our quirk_addfb_prefer_host_byte_order returns DRM_FORMAT_HOST_XRGB8888
+	 * for the 32bpp console. Rejecting that here (-ENOENT) is what made
+	 * fbdev emulation setup fail on every boot -- no /dev/fb0, no VT/fbcon,
+	 * and, because fb_helper->funcs is only assigned once setup succeeds, the
+	 * NULL-deref in the 6.18+ restore path on client exit. Accept the XRGB
+	 * console format too so the fbdev client comes up.
+	 */
 	if (mode_cmd->pixel_format != VIRTIO_GPU_PRIMARY_FORMAT &&
-	    mode_cmd->pixel_format != DRM_FORMAT_HOST_ARGB8888)
+	    mode_cmd->pixel_format != DRM_FORMAT_HOST_ARGB8888 &&
+	    mode_cmd->pixel_format != DRM_FORMAT_HOST_XRGB8888)
 		return ERR_PTR(-ENOENT);
 
 	/* lookup object associated with res handle */
