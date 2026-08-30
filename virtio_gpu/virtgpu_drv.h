@@ -49,8 +49,76 @@
 #include <drm/drm_gem.h>
 #include <drm/drm_gem_shmem_helper.h>
 #include <drm/drm_ioctl.h>
+#include <drm/drm_buddy.h>
 #include <drm/drm_probe_helper.h>
 #include <drm/virtgpu_drm.h>
+
+#include <linux/version.h>
+
+/* 7.1 moved the buddy allocator to the generic <linux/gpu_buddy.h> library (built-in
+ * CONFIG_GPU_BUDDY, still selected by DRM_BUDDY): struct drm_buddy became struct gpu_buddy and
+ * every drm_buddy_* symbol / DRM_BUDDY_* flag was renamed gpu_buddy_* / GPU_BUDDY_* 1:1 with
+ * unchanged signatures. <drm/drm_buddy.h> still exists but only carries print helpers, so keep
+ * the pre-7.1 spellings below and map them here. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 1, 0)
+#define drm_buddy			gpu_buddy
+#define drm_buddy_block			gpu_buddy_block
+#define drm_buddy_init			gpu_buddy_init
+#define drm_buddy_fini			gpu_buddy_fini
+#define drm_buddy_alloc_blocks		gpu_buddy_alloc_blocks
+#define drm_buddy_free_list		gpu_buddy_free_list
+#define drm_buddy_block_offset		gpu_buddy_block_offset
+#define drm_buddy_block_size		gpu_buddy_block_size
+#define DRM_BUDDY_RANGE_ALLOCATION	GPU_BUDDY_RANGE_ALLOCATION
+#define DRM_BUDDY_CONTIGUOUS_ALLOCATION	GPU_BUDDY_CONTIGUOUS_ALLOCATION
+#define DRM_BUDDY_CLEAR_ALLOCATION	GPU_BUDDY_CLEAR_ALLOCATION
+#endif
+
+/* drm_buddy_free_list() gained the flags argument with clear-page tracking in 6.10. */
+#ifdef DRM_BUDDY_CLEAR_ALLOCATION
+#define droidvm_drm_buddy_free_list(mm, objects) \
+	drm_buddy_free_list((mm), (objects), 0)
+#else
+#define droidvm_drm_buddy_free_list(mm, objects) \
+	drm_buddy_free_list((mm), (objects))
+#endif
+
+/* DroidVM guest-alloc: crosvm's downstream virtio feature (bit 6) + getparam (10). The kernel's
+ * <linux/virtio_gpu.h> / <drm/virtgpu_drm.h> predate them, and the fork's uapi copy is shadowed by
+ * the kernel header's include guard -- so define them here (included by every driver TU). */
+#ifndef VIRTIO_GPU_F_CREATE_GUEST_HANDLE
+#define VIRTIO_GPU_F_CREATE_GUEST_HANDLE 6
+#endif
+#ifndef VIRTGPU_PARAM_CREATE_GUEST_HANDLE
+#define VIRTGPU_PARAM_CREATE_GUEST_HANDLE 10
+#endif
+
+/* DroidVM guest-alloc pool accounting, for VK_EXT_memory_budget.
+ *
+ * In guest-alloc mode this driver owns the allocator, so nothing on the host side knows how full
+ * the pool is: crosvm only ever sees one sglist per blob. Without these, gfxstream's budget
+ * override bails out and the guest is told whatever turnip reports for the phone's system heap --
+ * several GiB against a pool that may be one. A client that honours VK_EXT_memory_budget then
+ * allocates until the pool hard-fails instead of backing off.
+ *
+ * KiB, not bytes: getparam copies out an int (upstream writes sizeof(int) through a u64 pointer),
+ * which caps a byte count at 2 GiB but a KiB count at 2 TiB.
+ *
+ * Three separate queries rather than one struct because no invariant spans them -- total is fixed
+ * after probe, and used and largest-free are each meaningful on their own -- so there is nothing
+ * for a torn read to break. The high numbers keep them clear of the upstream range (which ends at
+ * 10, itself already a crosvm downstream addition).
+ *
+ * LARGEST_FREE means "the largest allocation that can currently succeed", which is not always
+ * total - used. Under the page-bitmap allocator this driver started with it was the largest
+ * contiguous run, and fragmentation could fail an allocation with most of the pool free. Under
+ * drm_buddy an allocation is a list of blocks, so any chunk-aligned size up to the free total can
+ * be satisfied and the two figures coincide -- but the definition is the one that stays useful if
+ * the allocator changes again, and it is what a client actually needs to know.
+ */
+#define VIRTGPU_PARAM_GUEST_POOL_TOTAL_KIB 0x1000
+#define VIRTGPU_PARAM_GUEST_POOL_USED_KIB 0x1001
+#define VIRTGPU_PARAM_GUEST_POOL_LARGEST_FREE_KIB 0x1002
 
 #define DRIVER_NAME "virtio_gpu"
 #define DRIVER_DESC "virtio GPU"
@@ -126,6 +194,18 @@ struct virtio_gpu_object_vram {
 	 */
 	bool pool_resident;
 	u64 pool_offset;
+	/*
+	 * DroidVM guest-alloc: this pool-resident blob was sub-allocated by the GUEST driver
+	 * from the gpu_guest pool (not the host). The guest built the mem-entries
+	 * (pool GPAs) itself and must return the blocks to its own allocator on free.
+	 *
+	 * guest_pool_blocks holds them, in the order they were handed out -- the same order the
+	 * mem-entries were built in and the same order mmap stitches them into user VA, so the
+	 * guest and the host agree on which byte is where. pool_offset is meaningless for these
+	 * (there is no single offset); it stays for host-pool blobs, which are still one run.
+	 */
+	bool guest_pool_owned;
+	struct list_head guest_pool_blocks;
 	struct drm_mm_node vram_node;
 };
 
@@ -273,12 +353,41 @@ struct virtio_gpu_device {
 	bool has_resource_blob;
 	bool has_host_visible;
 	bool has_context_init;
+	/* DroidVM guest-alloc: VIRTIO_GPU_F_CREATE_GUEST_HANDLE negotiated (udmabuf=true). */
+	bool has_create_guest_handle;
 	struct virtio_shm_region host_visible_region;
 	struct drm_mm host_visible_mm;
 	/* DroidVM gfxstream pre-alloc: guest physical base of the boot-blessed GpuPool
 	 * (from the /reserved-memory "gfx_host" DT node), or 0 if absent. A
 	 * pool-resident blob maps gpu_pool_base + pool_offset directly. */
 	phys_addr_t gpu_pool_base;
+
+	/* DroidVM guest-alloc: the separate boot-blessed guest-alloc pool (from the
+	 * "gpu_guest" DT node). The guest driver OWNS this region: it sub-allocates
+	 * BLOB_MEM_GUEST backing from it (drm_buddy) and hands the pool GPAs to the
+	 * host as ordinary mem-entries, so the official attach_iov path works in a protected VM
+	 * (the pool is host-accessible, unlike arbitrary guest RAM). Zero base = guest-alloc off. */
+	phys_addr_t gpu_guest_pool_base;
+	u64 gpu_guest_pool_size;
+	/*
+	 * drm_buddy, not the page bitmap it replaced. The bitmap could only hand out one
+	 * contiguous run (bitmap_find_next_zero_area), so an allocation failed as soon as the
+	 * pool fragmented however much total space was free -- and a long session fragments.
+	 * A buddy allocator returns a list of blocks instead, which is exactly the shape the
+	 * rest of the path already wanted: virtio_gpu_mem_entry is an array, and the host side
+	 * has always iterated the sglist. The power-of-two structure also bounds the number of
+	 * blocks per allocation to roughly log2 rather than "however many holes exist", which
+	 * keeps both the entry count and the mmap loop short.
+	 *
+	 * The lock is ours to hold: drm_buddy documents locking as the caller's job.
+	 */
+	struct drm_buddy guest_pool_mm;
+	bool guest_pool_ready;
+	/* Whether an allocation has ever needed more than one block. Says out loud that the
+	 * scatter path is live rather than leaving it to be inferred from the absence of
+	 * failures -- a single-block-only run would look identical from outside. */
+	bool guest_pool_multiblock_seen;
+	struct mutex guest_pool_lock;
 
 	struct work_struct config_changed_work;
 
@@ -521,6 +630,21 @@ bool virtio_gpu_is_vram(struct virtio_gpu_object *bo);
 int virtio_gpu_vram_create(struct virtio_gpu_device *vgdev,
 			   struct virtio_gpu_object_params *params,
 			   struct virtio_gpu_object **bo_ptr);
+
+/* DroidVM guest-alloc pool (gpu_guest), in virtgpu_vram.c */
+int virtio_gpu_guest_pool_init(struct virtio_gpu_device *vgdev);
+void virtio_gpu_guest_pool_fini(struct virtio_gpu_device *vgdev);
+/* Reserve npages contiguous pages; returns byte offset within the pool, or -1 on OOM. */
+int virtio_gpu_guest_pool_alloc(struct virtio_gpu_device *vgdev, u64 size,
+				struct list_head *blocks);
+void virtio_gpu_guest_pool_free(struct virtio_gpu_device *vgdev, struct list_head *blocks);
+void virtio_gpu_guest_pool_release_object(struct virtio_gpu_device *vgdev,
+					  struct virtio_gpu_object *bo);
+void virtio_gpu_guest_pool_stats(struct virtio_gpu_device *vgdev, u64 *total_bytes,
+				 u64 *used_bytes, u64 *largest_free_bytes);
+int virtio_gpu_guest_pool_create(struct virtio_gpu_device *vgdev,
+				 struct virtio_gpu_object_params *params,
+				 struct virtio_gpu_object **bo_ptr);
 struct sg_table *virtio_gpu_vram_map_dma_buf(struct virtio_gpu_object *bo,
 					     struct device *dev,
 					     enum dma_data_direction dir);
@@ -531,5 +655,14 @@ void virtio_gpu_vram_unmap_dma_buf(struct device *dev,
 /* virtgpu_submit.c */
 int virtio_gpu_execbuffer_ioctl(struct drm_device *dev, void *data,
 				struct drm_file *file);
+
+
+/* See virtgpu_drv.c: per-operation tracing, off unless droidvm_trace is set. */
+extern bool virtio_gpu_droidvm_trace;
+#define virtio_gpu_trace(fmt, ...)                     \
+	do {                                           \
+		if (virtio_gpu_droidvm_trace)          \
+			pr_info(fmt, ##__VA_ARGS__);   \
+	} while (0)
 
 #endif

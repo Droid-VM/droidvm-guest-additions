@@ -265,12 +265,23 @@ int virtio_gpu_init(struct virtio_device *vdev, struct drm_device *dev)
 	if (virtio_has_feature(vgdev->vdev, VIRTIO_GPU_F_CONTEXT_INIT))
 		vgdev->has_context_init = true;
 
+	if (virtio_has_feature(vgdev->vdev, VIRTIO_GPU_F_CREATE_GUEST_HANDLE))
+		vgdev->has_create_guest_handle = true;
+	pr_info("virtio-gpu: has_create_guest_handle=%d\n",
+		vgdev->has_create_guest_handle);
+
 	/* Name the node it came from. The two renderers share this path, so a message that
 	 * named one of them was wrong half the time -- and this line is what a bringup checks
 	 * to see whether the host pool bound at all. */
 	vgdev->gpu_pool_base = virtio_gpu_find_pool_base(&pool_node);
 	if (vgdev->gpu_pool_base)
 		DRM_INFO("host pool: %s base %pa\n", pool_node, &vgdev->gpu_pool_base);
+
+	/* DroidVM guest-alloc: bring up the guest-owned pool allocator (gpu_guest),
+	 * if present. Absent => guest-alloc off (host-alloc / upstream shmem paths only). */
+	ret = virtio_gpu_guest_pool_init(vgdev);
+	if (ret)
+		DRM_WARN("guest-alloc pool init failed: %d (guest-alloc disabled)\n", ret);
 
 	DRM_INFO("features: %cvirgl %cedid %cresource_blob %chost_visible",
 		 vgdev->has_virgl_3d    ? '+' : '-',
@@ -375,6 +386,7 @@ void virtio_gpu_release(struct drm_device *dev)
 	virtio_gpu_modeset_fini(vgdev);
 	virtio_gpu_free_vbufs(vgdev);
 	virtio_gpu_cleanup_cap_cache(vgdev);
+	virtio_gpu_guest_pool_fini(vgdev);
 
 	if (vgdev->has_host_visible)
 		drm_mm_takedown(&vgdev->host_visible_mm);

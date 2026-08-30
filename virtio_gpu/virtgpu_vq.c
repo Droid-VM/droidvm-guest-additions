@@ -622,6 +622,16 @@ static void virtio_gpu_cmd_unref_cb(struct virtio_gpu_device *vgdev,
 	bo = vbuf->resp_cb_data;
 	vbuf->resp_cb_data = NULL;
 
+	/*
+	 * crosvm drops its dma-buf/resource references before replying. Do not return the
+	 * blocks to drm_buddy until that response arrives, or a new BO could reuse memory
+	 * which the host still has attached.
+	 */
+	if (le32_to_cpu(((struct virtio_gpu_ctrl_hdr *)vbuf->resp_buf)->type) ==
+		VIRTIO_GPU_RESP_OK_NODATA ||
+	    le32_to_cpu(((struct virtio_gpu_ctrl_hdr *)vbuf->resp_buf)->type) ==
+		VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID)
+		virtio_gpu_guest_pool_release_object(vgdev, bo);
 	virtio_gpu_cleanup_object(bo);
 }
 
@@ -641,8 +651,12 @@ void virtio_gpu_cmd_unref_resource(struct virtio_gpu_device *vgdev,
 
 	vbuf->resp_cb_data = bo;
 	ret = virtio_gpu_queue_ctrl_buffer(vgdev, vbuf);
-	if (ret < 0)
+	if (ret < 0) {
+		/* -ENODEV means the queue was never submitted; no future guest allocation can
+		 * use this pool after device removal, so drop the local blocks before cleanup. */
+		virtio_gpu_guest_pool_release_object(vgdev, bo);
 		virtio_gpu_cleanup_object(bo);
+	}
 }
 
 void virtio_gpu_cmd_set_scanout(struct virtio_gpu_device *vgdev,
