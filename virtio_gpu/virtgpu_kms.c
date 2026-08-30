@@ -74,9 +74,9 @@ static phys_addr_t virtio_gpu_find_pool_base_named(const char *prefix)
 
 static phys_addr_t virtio_gpu_find_pool_base(const char **which)
 {
-	phys_addr_t base = 0;
+	phys_addr_t base = virtio_gpu_find_pool_base_named("drm2kgsl_host");
 
-	*which = NULL;
+	*which = "drm2kgsl_host";
 	return base;
 }
 
