@@ -83,6 +83,13 @@ static phys_addr_t virtio_gpu_find_pool_base(const char **which)
 		base = virtio_gpu_find_pool_base_named("drm2kgsl_host");
 		*which = "drm2kgsl_host";
 	}
+	if (!base) {
+		/* venus (vkr) host-allocated transport shmems, same
+		 * pool-resident MAP_INFO_POOL contract as the other two
+		 */
+		base = virtio_gpu_find_pool_base_named("venus_host");
+		*which = "venus_host";
+	}
 	return base;
 }
 
