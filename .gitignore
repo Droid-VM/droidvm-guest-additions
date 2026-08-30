@@ -1,0 +1,5 @@
+# Build artifacts. build-packages.sh defaults OUTDIR to $PWD, and the documented way to
+# run it is from the repo root, so these land here every time.
+*.deb
+*.rpm
+*.ddeb
