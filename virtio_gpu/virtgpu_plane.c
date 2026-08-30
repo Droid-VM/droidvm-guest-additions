@@ -35,7 +35,12 @@
 #include "virtgpu_drv.h"
 
 static const uint32_t virtio_gpu_formats[] = {
-	DRM_FORMAT_HOST_XRGB8888,
+	VIRTIO_GPU_PRIMARY_FORMAT,
+	/* DroidVM R<->B experiment: ARGB8888 (AR24, BGRA order) removed from the plane's
+	 * advertised set. It is not in the intended scanout set -- crosvm's swizzle is keyed
+	 * on the fourcc and expects the desktop to declare ABGR8888 (AHB RGBA_8888, the
+	 * zero-copy-capable one) and fbcon to declare XRGB8888. AR24 only entered the list to
+	 * unbreak modeset after the mesa uprev. fb_create still accepts it. */
 };
 
 static const uint32_t virtio_gpu_cursor_formats[] = {
@@ -58,6 +63,9 @@ uint32_t virtio_gpu_translate_format(uint32_t drm_fourcc)
 		break;
 	case DRM_FORMAT_BGRA8888:
 		format = VIRTIO_GPU_FORMAT_A8R8G8B8_UNORM;
+		break;
+	case DRM_FORMAT_ABGR8888:
+		format = VIRTIO_GPU_FORMAT_R8G8B8A8_UNORM;
 		break;
 	default:
 		/*
