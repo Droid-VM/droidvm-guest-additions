@@ -3,24 +3,49 @@
 // Additional permissions apply; see ADDITIONAL-PERMISSIONS in the repository root.
 
 /*
- * Accept a Gunyah memparcel at an address the guest was never told about, and find out
- * whether it can be executed.
+ * Exercise a growable pool from inside the guest.
  *
- * A pseudo-unprotected VM puts the guest's whole RAM in a range the host SHAREs at runtime and
- * the guest accepts -- so the kernel, and the shim that runs before it, fetch instructions from
- * a stage-2 mapping made by MEM_ACCEPT rather than by the boot-time LEND. Two questions have to
- * be answered on real hardware before any of that can be designed around, and neither can be
- * asked through a driver that only ever accepts what a reserved-memory node describes.
+ * The pool is declared to us whole in a `droidvm,dynamic-pool` reserved-memory node but backed
+ * only up to `droidvm,pre-alloc-size`; the rest arrives when we ask for it, a `droidvm,step-size`
+ * multiple at a time, over virtio-gunyah-accept's pool queue.
  *
- *   echo "accept <gpa_hex> <size_mb> <handle_hex>"     > /sys/kernel/dynpool_test/cmd
- *   echo "acceptexec <gpa_hex> <size_mb> <handle_hex>" > /sys/kernel/dynpool_test/cmd
- *   echo "window <gpa_hex> <size_mb>"                  > /sys/kernel/dynpool_test/cmd
- *   echo "exec <off_mb>"                               > /sys/kernel/dynpool_test/cmd
+ * WHAT MUST BE TRUE AND CANNOT BE CHECKED FROM HERE
+ * -------------------------------------------------
+ * Touching the growable part before a grow covering it has returned 0 is not a recoverable error
+ * and this module cannot protect you from it. Measured on this hardware:
+ *
+ *     read  an ungranted address -> returns ZEROS. No fault, no error, no log, VM survives.
+ *     write an ungranted address -> "page fault ... attempt: -2", the vcpu dies, VM gone.
+ *
+ * The read is the dangerous direction: it is indistinguishable from real memory that happens to
+ * be zero. So this module never touches an address it has not just been granted, and the negative
+ * tests below deliberately exercise REQUEST rejection rather than access faults -- asking for a
+ * misaligned range is safe and proves the host's validation; reading an ungranted address proves
+ * nothing and corrupts the result of whatever runs next.
+ *
+ * WHAT THE HOST SIDE SHOULD SHOW
+ * ------------------------------
+ * A grow is not just bookkeeping: the range is faulted in and folded into 2 MiB folios, which the
+ * reserve module's allocation hook intercepts. So on the Android side, across a grow:
+ *
+ *     /sys/module/gh_hugepage_reserve/parameters/refill_stat: served RISES, pool_avail FALLS
+ *
+ * and across a shrink the reverse, because the host punches the range out of the pool memfd and
+ * the module's order-9 free hook takes the pages back. If served does not move, the grant did not
+ * come from the reserve pool and something is wrong even though every test here passes.
+ *
+ *   echo "grow <offset_mb> <len_mb>"  > /sys/kernel/dynpool_test/cmd
+ *   echo "shrink <offset_mb> <len_mb>" > /sys/kernel/dynpool_test/cmd
+ *   echo "verify <offset_mb> <len_mb>" > /sys/kernel/dynpool_test/cmd   (write+read a pattern)
+ *   echo "reject" > /sys/kernel/dynpool_test/cmd    (every rejection path, no memory touched)
+ *   echo "selftest" > /sys/kernel/dynpool_test/cmd  (grow, verify, query, shrink)
  *   cat /sys/kernel/dynpool_test/result
  */
 
 #include <linux/module.h>
 #include <linux/kernel.h>
+#include <linux/of.h>
+#include <linux/of_address.h>
 #include <linux/io.h>
 #include <linux/slab.h>
 #include <linux/kobject.h>
@@ -33,11 +58,54 @@
 
 #define MB (1UL << 20)
 
+static u64 pool_base, pool_size, pool_prealloc, pool_step;
+static u32 pool_id;
 static struct kobject *dp_kobj;
 static bool dp_misc_ok;
-/* What /dev/dynpool maps: the range `accept` just took, which is outside every pool and is
- * the case the pseudo-unprotected window cares about. */
+/* What /dev/dynpool maps: the active pool, or the range `accept` just took (which is outside
+ * every pool, and is the case the pseudo-unprotected window cares about). */
 static u64 dp_map_base, dp_map_size;
+
+/* All droidvm,dynamic-pool nodes, so the two-pool / hole-in-the-middle case can be
+ * driven from one module. `select <pool_id>` repoints the globals above at one of these. */
+#define DP_MAX_POOLS 4
+struct dp_pool {
+	u64 base, size, prealloc, step;
+	u32 id;
+};
+static struct dp_pool dp_pools[DP_MAX_POOLS];
+static int dp_npools;
+
+/*
+ * Module parameters that stand in for the device-tree node.
+ *
+ * The sm8650-era RM refuses to start a VM whose `/reserved-memory` child has a `reg` that no
+ * accepted memparcel matches -- which is every pool that is declared but not pre-shared, i.e.
+ * exactly the growable ones. crosvm can leave the node out (DROIDVM_POOL_HIDE=dt) and the pool
+ * still works, because the pool table lives on the host and is keyed by pool-id, not by the node.
+ * The guest then has nothing to read, so it is told here instead.
+ */
+static u64 param_base, param_size, param_prealloc, param_step;
+static uint param_id;
+module_param_named(base, param_base, ullong, 0444);
+MODULE_PARM_DESC(base, "pool base GPA when the DT node is absent");
+module_param_named(size, param_size, ullong, 0444);
+module_param_named(prealloc, param_prealloc, ullong, 0444);
+module_param_named(step, param_step, ullong, 0444);
+module_param_named(id, param_id, uint, 0444);
+
+static void dp_activate(int idx)
+{
+	if (idx < 0 || idx >= dp_npools)
+		return;
+	pool_base = dp_pools[idx].base;
+	pool_size = dp_pools[idx].size;
+	pool_prealloc = dp_pools[idx].prealloc;
+	pool_step = dp_pools[idx].step;
+	pool_id = dp_pools[idx].id;
+	dp_map_base = pool_base;
+	dp_map_size = pool_size;
+}
 
 /* Last result, read back through sysfs. */
 static char result[4096];
@@ -58,6 +126,194 @@ static void say_reset(void)
 {
 	result_len = 0;
 	result[0] = '\0';
+}
+
+/*
+ * Write a pattern over a range and read it back.
+ *
+ * Only ever called for a range a grow has just returned 0 for. memremap() rather than a plain
+ * pointer because the pool is no-map: the kernel has no linear mapping for it, deliberately, so
+ * that nothing wanders in by accident.
+ */
+static int verify_range(u64 offset, u64 len)
+{
+	void *va;
+	u64 i;
+	int ret = 0;
+
+	va = memremap(pool_base + offset, len, MEMREMAP_WB);
+	if (!va) {
+		say("  memremap(%#llx+%#llx) failed\n", pool_base + offset, len);
+		return -ENOMEM;
+	}
+	/* One word per 4 KiB: enough to catch a range that is only partly backed, without
+	 * spending seconds writing tens of megabytes. */
+	for (i = 0; i < len; i += 4096)
+		*(u64 *)(va + i) = 0xD501D0000000ULL | (offset + i);
+	for (i = 0; i < len; i += 4096) {
+		u64 want = 0xD501D0000000ULL | (offset + i);
+		u64 got = *(u64 *)(va + i);
+
+		if (got != want) {
+			say("  MISMATCH at +%#llx: wrote %#llx read %#llx%s\n",
+			    offset + i, want, got,
+			    got == 0 ? "  (zero: this range is NOT backed)" : "");
+			ret = -EIO;
+			break;
+		}
+	}
+	memunmap(va);
+	if (!ret)
+		say("  verified %#llx+%#llx\n", offset, len);
+	return ret;
+}
+
+/* Every way a request must be refused. Touches no memory, so it is safe to run at any time. */
+static void test_rejections(void)
+{
+	u64 growable = pool_size - pool_prealloc;
+	int rc;
+	struct {
+		const char *what;
+		u64 off, len;
+		int want;
+	} cases[] = {
+		{ "below the pre-shared floor", 0, pool_step, -EINVAL },
+		{ "past the window", pool_size, pool_step, -EINVAL },
+		{ "length past the window", pool_size - pool_step, pool_step * 2, -EINVAL },
+		{ "misaligned offset", pool_prealloc + 4096, pool_step, -EINVAL },
+		{ "misaligned length", pool_prealloc, pool_step + 4096, -EINVAL },
+		{ "zero length", pool_prealloc, 0, -EINVAL },
+		{ "releasing what was never granted", pool_prealloc, pool_step, -ENOENT },
+	};
+	int i;
+
+	say("rejections:\n");
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		if (i == ARRAY_SIZE(cases) - 1)
+			rc = gunyah_pool_shrink(pool_id, cases[i].off, cases[i].len);
+		else
+			rc = gunyah_pool_grow(pool_id, cases[i].off, cases[i].len);
+		say("  %-34s -> %d %s\n", cases[i].what, rc,
+		    rc == cases[i].want ? "ok" : "UNEXPECTED");
+	}
+
+	/* Overlap needs a live grant to overlap with. */
+	if (growable >= pool_step * 2) {
+		rc = gunyah_pool_grow(pool_id, pool_prealloc, pool_step);
+		if (rc == 0) {
+			rc = gunyah_pool_grow(pool_id, pool_prealloc, pool_step);
+			say("  %-34s -> %d %s\n", "granting the same range twice", rc,
+			    rc == -EEXIST ? "ok" : "UNEXPECTED");
+			/* Starting BEFORE a live grant and running into it: the case a naive
+			 * "is this offset taken" check misses. */
+			rc = gunyah_pool_grow(pool_id, pool_prealloc, pool_step * 2);
+			say("  %-34s -> %d %s\n", "a range enclosing a live grant", rc,
+			    rc == -EEXIST ? "ok" : "UNEXPECTED");
+			/* A grant is one memparcel and the RM reclaims it whole. */
+			rc = gunyah_pool_shrink(pool_id, pool_prealloc, pool_step * 2);
+			say("  %-34s -> %d %s\n", "releasing more than was taken", rc,
+			    rc == -ERANGE || rc == -EINVAL ? "ok" : "UNEXPECTED");
+			gunyah_pool_shrink(pool_id, pool_prealloc, pool_step);
+		} else {
+			say("  (skipped overlap cases: grow returned %d)\n", rc);
+		}
+	}
+}
+
+/*
+ * A grant with something built over it must refuse to be released.
+ *
+ * The reference a real dma-buf import takes is only taken for pools with a non-zero step, and the
+ * pool the GPU uses is fully pre-shared -- so without a way to take one by hand, this path could
+ * not be reached on device at all. gunyah_pool_test_ref stands in for the import.
+ */
+static void test_busy(void)
+{
+	u64 off = pool_prealloc, len = pool_step;
+	int rc;
+
+	say("busy:\n");
+	if (pool_step == 0 || pool_prealloc >= pool_size) {
+		say("  pool is not growable; nothing to do\n");
+		return;
+	}
+
+	rc = gunyah_pool_grow(pool_id, off, len);
+	say("  grow                          -> %d\n", rc);
+	if (rc)
+		return;
+
+	rc = gunyah_pool_test_ref(pool_id, off, len, true);
+	say("  take a reference              -> %d %s\n", rc, rc == 0 ? "ok" : "UNEXPECTED");
+
+	rc = gunyah_pool_shrink(pool_id, off, len);
+	say("  shrink while referenced       -> %d %s\n", rc,
+	    rc == -EBUSY ? "ok (refused)" : "UNEXPECTED -- it should have been refused");
+
+	rc = gunyah_pool_test_ref(pool_id, off, len, false);
+	say("  drop the reference            -> %d\n", rc);
+
+	rc = gunyah_pool_shrink(pool_id, off, len);
+	say("  shrink after dropping it      -> %d %s\n", rc, rc == 0 ? "ok" : "UNEXPECTED");
+
+	/* A reference is refused outright over memory that was never granted -- the same check
+	 * that stops a dma-buf being built over a hole in the sparse pool memfd. */
+	rc = gunyah_pool_test_ref(pool_id, off, len, true);
+	say("  reference an ungranted range  -> %d %s\n", rc,
+	    rc == -EFAULT ? "ok (refused)" : "UNEXPECTED -- it should have been refused");
+}
+
+static void test_selftest(void)
+{
+	u64 off = pool_prealloc;
+	u64 len = pool_step;
+	u64 live = 0;
+	int rc;
+
+	say("selftest:\n");
+	if (pool_step == 0) {
+		say("  pool is not growable (step 0); nothing to do\n");
+		return;
+	}
+	if (pool_prealloc >= pool_size) {
+		say("  pool is fully pre-shared; nothing to grow\n");
+		return;
+	}
+
+	rc = gunyah_pool_grow(pool_id, off, len);
+	say("  grow %#llx+%#llx -> %d\n", off, len, rc);
+	if (rc)
+		return;
+	if (verify_range(off, len))
+		return;
+
+	/* A second, larger grant: one memparcel however many steps it spans. */
+	if (pool_size - pool_prealloc >= len + pool_step * 2) {
+		u64 off2 = off + len, len2 = pool_step * 2;
+
+		rc = gunyah_pool_grow(pool_id, off2, len2);
+		say("  grow %#llx+%#llx -> %d  (2 steps, still ONE memparcel)\n",
+		    off2, len2, rc);
+		if (rc == 0) {
+			verify_range(off2, len2);
+			/* The first grant must still be intact: a second grow must not have
+			 * disturbed it. */
+			verify_range(off, len);
+			rc = gunyah_pool_shrink(pool_id, off2, len2);
+			say("  shrink %#llx+%#llx -> %d\n", off2, len2, rc);
+		}
+	}
+
+	rc = gunyah_pool_query(pool_id, &live);
+	say("  query -> %d, host says %llu live grant(s)\n", rc, live);
+
+	rc = gunyah_pool_shrink(pool_id, off, len);
+	say("  shrink %#llx+%#llx -> %d\n", off, len, rc);
+
+	rc = gunyah_pool_query(pool_id, &live);
+	say("  query -> %d, host says %llu live grant(s)\n", rc, live);
+	say("  NOW CHECK THE HOST: served should have fallen back and pool_avail risen\n");
 }
 
 /*
@@ -235,7 +491,7 @@ static ssize_t cmd_store(struct kobject *k, struct kobj_attribute *a,
 {
 	char verb[16];
 	u64 a_mb = 0, b_mb = 0;
-	int n;
+	int n, rc;
 
 	mutex_lock(&result_lock);
 	say_reset();
@@ -280,11 +536,38 @@ static ssize_t cmd_store(struct kobject *k, struct kobj_attribute *a,
 		goto out;
 	}
 
-	if (!strcmp(verb, "exec") && n >= 2) {
+	if (!strcmp(verb, "select") && n >= 2) {
+		int i, hit = -1;
+		for (i = 0; i < dp_npools; i++)
+			if (dp_pools[i].id == (u32)a_mb)
+				hit = i;
+		if (hit < 0) {
+			say("no pool with id %llu (have %d pools)\n", a_mb, dp_npools);
+		} else {
+			dp_activate(hit);
+			say("selected pool_id %u (base %#llx, %llu MB, pre %llu MB, step %llu MB)\n",
+			    pool_id, pool_base, pool_size / MB, pool_prealloc / MB, pool_step / MB);
+		}
+	} else if (!strcmp(verb, "selftest")) {
+		test_selftest();
+	} else if (!strcmp(verb, "reject")) {
+		test_rejections();
+	} else if (!strcmp(verb, "busy")) {
+		test_busy();
+	} else if (!strcmp(verb, "grow") && n == 3) {
+		rc = gunyah_pool_grow(pool_id, a_mb * MB, b_mb * MB);
+		say("grow %llu MB at +%llu MB -> %d\n", b_mb, a_mb, rc);
+	} else if (!strcmp(verb, "shrink") && n == 3) {
+		rc = gunyah_pool_shrink(pool_id, a_mb * MB, b_mb * MB);
+		say("shrink %llu MB at +%llu MB -> %d\n", b_mb, a_mb, rc);
+	} else if (!strcmp(verb, "verify") && n == 3) {
+		verify_range(a_mb * MB, b_mb * MB);
+	} else if (!strcmp(verb, "exec") && n >= 2) {
 		test_exec_el1(a_mb * MB);
 	} else {
-		say("usage: exec <off_mb> | window <gpa_hex> <size_mb> | "
-		    "accept <gpa_hex> <size_mb> <handle_hex> | "
+		say("usage: selftest | reject | busy | grow <off_mb> <len_mb> | "
+		    "shrink <off_mb> <len_mb> | verify <off_mb> <len_mb> | "
+		    "exec <off_mb> | accept <gpa_hex> <size_mb> <handle_hex> | "
 		    "acceptexec <gpa_hex> <size_mb> <handle_hex>\n");
 	}
 out:
@@ -302,22 +585,82 @@ static ssize_t result_show(struct kobject *k, struct kobj_attribute *a, char *bu
 	return n;
 }
 
+static ssize_t info_show(struct kobject *k, struct kobj_attribute *a, char *buf)
+{
+	return scnprintf(buf, PAGE_SIZE,
+			 "pool_id     %u\n"
+			 "base        %#llx\n"
+			 "size        %llu MB\n"
+			 "pre_alloc   %llu MB   (backed before boot; never released)\n"
+			 "step        %llu MB   (0 = not growable)\n"
+			 "growable    %llu MB\n",
+			 pool_id, pool_base, pool_size / MB, pool_prealloc / MB,
+			 pool_step / MB, (pool_size - pool_prealloc) / MB);
+}
+
 static struct kobj_attribute cmd_attr = __ATTR(cmd, 0200, NULL, cmd_store);
 static struct kobj_attribute result_attr = __ATTR(result, 0444, result_show, NULL);
+static struct kobj_attribute info_attr = __ATTR(info, 0444, info_show, NULL);
 
 static struct attribute *dp_attrs[] = {
 	&cmd_attr.attr,
 	&result_attr.attr,
+	&info_attr.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(dp);
 
 static int __init dp_init(void)
 {
+	struct device_node *np;
+	struct resource res;
 	int ret;
 
+	/* Collect EVERY dynamic-pool node so both a two-pool layout and a single pool work. */
+	np = NULL;
+	for_each_compatible_node(np, NULL, "droidvm,dynamic-pool") {
+		struct dp_pool *dp;
+
+		if (dp_npools >= DP_MAX_POOLS)
+			break;
+		if (of_address_to_resource(np, 0, &res))
+			continue;
+		dp = &dp_pools[dp_npools];
+		dp->base = res.start;
+		/* `reg` is the pre-shared floor, not the window: android14-6.1's resource manager
+		 * refuses a VM whose reserved-memory node describes a range no memparcel matches,
+		 * and before boot only the floor is one. The window's size comes alongside; a pool
+		 * that is fully pre-shared omits it, because there the floor is the window. */
+		if (of_property_read_u64(np, "droidvm,pool-size", &dp->size))
+			dp->size = resource_size(&res);
+		/* Absent means "fully pre-shared": a pool that does not say how much to hold back
+		 * is an ordinary non-growable one. */
+		if (of_property_read_u64(np, "droidvm,pre-alloc-size", &dp->prealloc))
+			dp->prealloc = resource_size(&res);
+		if (of_property_read_u64(np, "droidvm,step-size", &dp->step))
+			dp->step = 0;
+		if (of_property_read_u32(np, "droidvm,pool-id", &dp->id))
+			dp->id = 0;
+		dp_npools++;
+	}
+	if (dp_npools == 0 && param_size) {
+		struct dp_pool *dp = &dp_pools[dp_npools++];
+
+		dp->base = param_base;
+		dp->size = param_size;
+		dp->prealloc = param_prealloc;
+		dp->step = param_step ? param_step : param_size;
+		dp->id = param_id;
+		pr_info("dynpool_test: no DT node; using module parameters\n");
+	}
+	if (dp_npools == 0) {
+		pr_info("dynpool_test: no droidvm,dynamic-pool node and no base=/size=; nothing to test\n");
+		return -ENODEV;
+	}
+	dp_activate(0);
+
 	if (!gunyah_guest_available())
-		pr_warn("dynpool_test: RM not available; accept will fail\n");
+		pr_warn("dynpool_test: RM not available; grow/shrink will fail\n");
 
 	dp_kobj = kobject_create_and_add("dynpool_test", kernel_kobj);
 	if (!dp_kobj)
@@ -336,7 +679,8 @@ static int __init dp_init(void)
 	else
 		dp_misc_ok = true;
 
-	pr_info("dynpool_test: ready; nothing is mapped until `window` or `accept` says where\n");
+	pr_info("dynpool_test: %d pool(s); active pool %u at %#llx, %llu MB (%llu MB pre-shared, step %llu MB)\n",
+		dp_npools, pool_id, pool_base, pool_size / MB, pool_prealloc / MB, pool_step / MB);
 	return 0;
 }
 
@@ -354,5 +698,5 @@ static void __exit dp_exit(void)
 module_init(dp_init);
 module_exit(dp_exit);
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("DroidVM: accept a Gunyah memparcel anywhere and probe execute permission");
+MODULE_DESCRIPTION("DroidVM: exercise a growable Gunyah memory pool");
 MODULE_AUTHOR("DroidVM");

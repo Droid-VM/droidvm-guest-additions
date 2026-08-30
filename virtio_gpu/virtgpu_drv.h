@@ -369,6 +369,12 @@ struct virtio_gpu_device {
 	 * (the pool is host-accessible, unlike arbitrary guest RAM). Zero base = guest-alloc off. */
 	phys_addr_t gpu_guest_pool_base;
 	u64 gpu_guest_pool_size;
+	/* Dynamic guest pool metadata. The full drm_buddy tree exists for the whole window, but
+	 * allocations are restricted to this currently SHARE'd prefix. */
+	u32 gpu_guest_pool_id;
+	u64 gpu_guest_pool_prealloc;
+	u64 gpu_guest_pool_backed;
+	u64 gpu_guest_pool_step;
 	/*
 	 * drm_buddy, not the page bitmap it replaced. The bitmap could only hand out one
 	 * contiguous run (bitmap_find_next_zero_area), so an allocation failed as soon as the
@@ -388,6 +394,7 @@ struct virtio_gpu_device {
 	 * failures -- a single-block-only run would look identical from outside. */
 	bool guest_pool_multiblock_seen;
 	struct mutex guest_pool_lock;
+	struct delayed_work guest_pool_reclaim_work;
 
 	struct work_struct config_changed_work;
 

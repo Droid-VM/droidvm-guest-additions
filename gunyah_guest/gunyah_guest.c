@@ -283,6 +283,46 @@ struct virtio_gunyah_accept_comp {
 	__le32 ret;	/* 0 or negative errno, two's complement */
 };
 
+/*
+ * Queue 2, guest -> host: the pool control plane.
+ *
+ * A third queue rather than a new op on the pair above, for two reasons visible in the structs:
+ * the completion is eight bytes with nowhere to put an offset and a length, and its req_id is
+ * assigned by the HOST, which drops any completion whose id it did not issue. Carrying the
+ * direction in the queue also means the host cannot forget to range-check -- everything arriving
+ * there is by construction guest-originated.
+ */
+#define VGP_OP_SHARE	1
+#define VGP_OP_UNSHARE	2
+#define VGP_OP_QUERY	3
+/* Debug-only, for the growable-pool test driver: take/drop the reference a dma-buf import would.
+ * Lets the "a grant in use cannot be released" path be exercised without making the pool the GPU
+ * uses growable. */
+#define VGP_OP_TEST_REF		100
+#define VGP_OP_TEST_UNREF	101
+
+struct virtio_gunyah_pool_req {
+	__le32 req_id;		/* guest-assigned; echoed back in the response */
+	__le32 op;
+	__le32 pool_id;		/* index of the growable pool, in address order */
+	__le32 flags;		/* reserved, 0 */
+	__le64 offset;		/* from the pool base */
+	__le64 len;
+};
+
+struct virtio_gunyah_pool_resp {
+	__le32 req_id;
+	__le32 ret;		/* 0 or negative errno */
+	__le64 extra;		/* QUERY: live grant count. Otherwise 0. */
+};
+
+/* One in-flight pool request. The submitter sleeps on `done`; the vq callback wakes it. */
+struct vga_pool_ctx {
+	struct virtio_gunyah_pool_req req;
+	struct virtio_gunyah_pool_resp resp;
+	struct completion done;
+};
+
 /* gpa-keyed owner table entry: the guest side of a Sync-accepted parcel. */
 struct vga_accepted {
 	struct list_head node;
@@ -295,6 +335,11 @@ struct vga_dev {
 	struct virtio_device *vdev;
 	struct virtqueue *req_vq;
 	struct virtqueue *comp_vq;
+	struct virtqueue *pool_vq;
+	/* Serializes pool_vq submission; the queue is shallow and requests are rare. */
+	struct mutex pool_lock;
+	spinlock_t pool_cb_lock;
+	u32 pool_next_id;
 	/* Serializes comp_vq access between the work fn and the reclaim cb. */
 	spinlock_t comp_lock;
 	struct work_struct work;
@@ -443,13 +488,160 @@ static void vga_comp_cb(struct virtqueue *vq)
 	spin_unlock_irqrestore(&vga->comp_lock, flags);
 }
 
+/* Pool response arrived: wake whoever is waiting on it. */
+static void vga_pool_cb(struct virtqueue *vq)
+{
+	struct vga_dev *vga = vq->vdev->priv;
+	struct vga_pool_ctx *ctx;
+	unsigned long flags;
+	unsigned int len;
+
+	spin_lock_irqsave(&vga->pool_cb_lock, flags);
+	while ((ctx = virtqueue_get_buf(vq, &len)))
+		complete(&ctx->done);
+	spin_unlock_irqrestore(&vga->pool_cb_lock, flags);
+}
+
+/* The one device, for the exported API. Set at probe, cleared at remove. */
+static struct vga_dev *vga_singleton;
+static DEFINE_MUTEX(vga_singleton_lock);
+
+/*
+ * Ask the host to grow or shrink a growable pool, and wait for the answer.
+ *
+ * MUST be called from process context and MUST NOT be called from the thread that services the
+ * accept requestq: a grow is answered only after the host has SHARE'd the memory and driven an
+ * ACCEPT back through queue 0, so a caller that is itself the accept path would be waiting on
+ * work it is required to perform. In practice callers are consumer drivers (the GPU allocator,
+ * say), which are already a different context; the rule is written down because violating it
+ * deadlocks rather than failing.
+ *
+ * Returns the host's verdict: 0, or a negative errno. -ETIMEDOUT means the request's fate is
+ * UNKNOWN -- the host may have completed it -- so the caller must reconcile with
+ * gunyah_pool_query() rather than assume it did not happen.
+ */
+static int vga_pool_request(u32 op, u32 pool_id, u64 offset, u64 len, u64 *extra)
+{
+	struct scatterlist sg_out, sg_in, *sgs[2];
+	struct vga_pool_ctx *ctx;
+	struct vga_dev *vga;
+	int ret;
+
+	might_sleep();
+
+	mutex_lock(&vga_singleton_lock);
+	vga = vga_singleton;
+	mutex_unlock(&vga_singleton_lock);
+	if (!vga || !vga->pool_vq)
+		return -ENODEV;
+
+	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
+	if (!ctx)
+		return -ENOMEM;
+	init_completion(&ctx->done);
+
+	mutex_lock(&vga->pool_lock);
+	ctx->req.req_id  = cpu_to_le32(vga->pool_next_id++);
+	ctx->req.op      = cpu_to_le32(op);
+	ctx->req.pool_id = cpu_to_le32(pool_id);
+	ctx->req.offset  = cpu_to_le64(offset);
+	ctx->req.len     = cpu_to_le64(len);
+
+	sg_init_one(&sg_out, &ctx->req, sizeof(ctx->req));
+	sg_init_one(&sg_in, &ctx->resp, sizeof(ctx->resp));
+	sgs[0] = &sg_out;
+	sgs[1] = &sg_in;
+	ret = virtqueue_add_sgs(vga->pool_vq, sgs, 1, 1, ctx, GFP_KERNEL);
+	if (ret) {
+		mutex_unlock(&vga->pool_lock);
+		kfree(ctx);
+		return ret;
+	}
+	virtqueue_kick(vga->pool_vq);
+	mutex_unlock(&vga->pool_lock);
+
+	/*
+	 * Generous, because a grow is not one round trip: the host allocates the backing, SHAREs
+	 * it, then drives an ACCEPT back to this module and waits for the RM. Short timeouts here
+	 * would turn a slow grow into a desync, which is far more expensive than waiting.
+	 */
+	if (!wait_for_completion_timeout(&ctx->done, msecs_to_jiffies(30000))) {
+		/*
+		 * The buffer is still owned by the device, so it cannot be freed -- leak the ctx
+		 * rather than hand the host memory that may be reused. Rare enough to be the right
+		 * trade; a device reset reclaims it.
+		 */
+		dev_err(&vga->vdev->dev,
+			"pool op=%u pool=%u offset=%#llx len=%#llx timed out; state unknown\n",
+			op, pool_id, offset, len);
+		return -ETIMEDOUT;
+	}
+
+	ret = (s32)le32_to_cpu(ctx->resp.ret);
+	if (extra)
+		*extra = le64_to_cpu(ctx->resp.extra);
+	kfree(ctx);
+	return ret;
+}
+
+/* Grow a pool by [offset, offset+len). Both must be multiples of the pool's step. */
+int gunyah_pool_grow(u32 pool_id, u64 offset, u64 len)
+{
+	return vga_pool_request(VGP_OP_SHARE, pool_id, offset, len, NULL);
+}
+EXPORT_SYMBOL_GPL(gunyah_pool_grow);
+
+/* Hand a range back. The HOST decides whether it is safe: it is the only side that knows whether
+ * a dma-buf or GPU mapping still references those pages, because this guest's RESOURCE_UNREF is
+ * fire-and-forget. */
+int gunyah_pool_shrink(u32 pool_id, u64 offset, u64 len)
+{
+	return vga_pool_request(VGP_OP_UNSHARE, pool_id, offset, len, NULL);
+}
+EXPORT_SYMBOL_GPL(gunyah_pool_shrink);
+
+/* How many grants the HOST believes are live. For reconciling after a timeout or a driver reload,
+ * where this side's idea of what is granted may be wrong. */
+int gunyah_pool_query(u32 pool_id, u64 *live_grants)
+{
+	return vga_pool_request(VGP_OP_QUERY, pool_id, 0, 0, live_grants);
+}
+EXPORT_SYMBOL_GPL(gunyah_pool_query);
+
+/* Query one range rather than only the total grant count. This is the only safe way to recover
+ * from a timed-out SHARE/UNSHARE: the host may have completed the request even though its reply
+ * was lost, and a count cannot tell the caller which range changed state. */
+int gunyah_pool_query_range(u32 pool_id, u64 offset, u64 len, bool *backed)
+{
+	u64 extra = 0;
+	int ret;
+
+	if (!backed)
+		return -EINVAL;
+	ret = vga_pool_request(VGP_OP_QUERY, pool_id, offset, len, &extra);
+	if (!ret)
+		*backed = !!extra;
+	return ret;
+}
+EXPORT_SYMBOL_GPL(gunyah_pool_query_range);
+
+/* Debug only. Stands in for a host-side dma-buf import so a test can check that a grant with
+ * something built over it refuses to be released. Not for production callers. */
+int gunyah_pool_test_ref(u32 pool_id, u64 offset, u64 len, bool take)
+{
+	return vga_pool_request(take ? VGP_OP_TEST_REF : VGP_OP_TEST_UNREF,
+				pool_id, offset, len, NULL);
+}
+EXPORT_SYMBOL_GPL(gunyah_pool_test_ref);
+
 static int vga_probe(struct virtio_device *vdev)
 {
 	struct virtqueue_info vqs_info[] = {
 		{ "request", vga_req_cb },
 		{ "completion", vga_comp_cb },
+		{ "pool", vga_pool_cb },
 	};
-	struct virtqueue *vqs[2];
+	struct virtqueue *vqs[3];
 	struct vga_dev *vga;
 	int i, ret;
 
@@ -459,14 +651,18 @@ static int vga_probe(struct virtio_device *vdev)
 	vga->vdev = vdev;
 	vdev->priv = vga;
 	spin_lock_init(&vga->comp_lock);
+	spin_lock_init(&vga->pool_cb_lock);
+	mutex_init(&vga->pool_lock);
+	vga->pool_next_id = 1;
 	INIT_LIST_HEAD(&vga->accepted);
 	INIT_WORK(&vga->work, vga_work_func);
 
-	ret = virtio_find_vqs(vdev, 2, vqs, vqs_info, NULL);
+	ret = virtio_find_vqs(vdev, 3, vqs, vqs_info, NULL);
 	if (ret)
 		goto err_free;
 	vga->req_vq = vqs[0];
 	vga->comp_vq = vqs[1];
+	vga->pool_vq = vqs[2];
 
 	/* Pre-post the device-writable request buffers. */
 	for (i = 0; i < VGA_NUM_REQ_BUFS; i++) {
@@ -488,7 +684,11 @@ static int vga_probe(struct virtio_device *vdev)
 	virtio_device_ready(vdev);
 	virtqueue_kick(vga->req_vq);
 
-	dev_info(&vdev->dev, "gunyah accept transport ready (rm %savailable)\n",
+	mutex_lock(&vga_singleton_lock);
+	vga_singleton = vga;
+	mutex_unlock(&vga_singleton_lock);
+
+	dev_info(&vdev->dev, "gunyah accept transport ready (rm %savailable), pool queue up\n",
 		 gunyah_guest_available() ? "" : "NOT ");
 	return 0;
 
@@ -506,6 +706,15 @@ static void vga_remove(struct virtio_device *vdev)
 	struct vga_dev *vga = vdev->priv;
 	struct vga_accepted *ent, *tmp;
 	int i;
+
+	/* Stop new pool requests finding the device before anything is torn down. A caller already
+	 * inside vga_pool_request holds no reference to it beyond the vq, which virtio_reset_device
+	 * below completes -- its wait then times out and reports the state as unknown, which is the
+	 * honest answer during an unbind. */
+	mutex_lock(&vga_singleton_lock);
+	if (vga_singleton == vga)
+		vga_singleton = NULL;
+	mutex_unlock(&vga_singleton_lock);
 
 	virtio_reset_device(vdev);
 	cancel_work_sync(&vga->work);
