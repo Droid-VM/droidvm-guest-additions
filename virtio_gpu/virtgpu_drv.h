@@ -53,6 +53,27 @@
 #include <drm/drm_probe_helper.h>
 #include <drm/virtgpu_drm.h>
 
+#include <linux/version.h>
+
+/* 7.1 moved the buddy allocator to the generic <linux/gpu_buddy.h> library (built-in
+ * CONFIG_GPU_BUDDY, still selected by DRM_BUDDY): struct drm_buddy became struct gpu_buddy and
+ * every drm_buddy_* symbol / DRM_BUDDY_* flag was renamed gpu_buddy_* / GPU_BUDDY_* 1:1 with
+ * unchanged signatures. <drm/drm_buddy.h> still exists but only carries print helpers, so keep
+ * the pre-7.1 spellings below and map them here. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 1, 0)
+#define drm_buddy			gpu_buddy
+#define drm_buddy_block			gpu_buddy_block
+#define drm_buddy_init			gpu_buddy_init
+#define drm_buddy_fini			gpu_buddy_fini
+#define drm_buddy_alloc_blocks		gpu_buddy_alloc_blocks
+#define drm_buddy_free_list		gpu_buddy_free_list
+#define drm_buddy_block_offset		gpu_buddy_block_offset
+#define drm_buddy_block_size		gpu_buddy_block_size
+#define DRM_BUDDY_RANGE_ALLOCATION	GPU_BUDDY_RANGE_ALLOCATION
+#define DRM_BUDDY_CONTIGUOUS_ALLOCATION	GPU_BUDDY_CONTIGUOUS_ALLOCATION
+#define DRM_BUDDY_CLEAR_ALLOCATION	GPU_BUDDY_CLEAR_ALLOCATION
+#endif
+
 /* drm_buddy_free_list() gained the flags argument with clear-page tracking in 6.10. */
 #ifdef DRM_BUDDY_CLEAR_ALLOCATION
 #define droidvm_drm_buddy_free_list(mm, objects) \
