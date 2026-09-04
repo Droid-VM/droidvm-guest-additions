@@ -13,6 +13,12 @@ set -e
 PKG=@PKG@
 VER=@VER@
 
+# Where dkms keeps the sources it was handed and the per-version state it builds in. Absolute in
+# every real install; overridable so tests/test-hooks.sh can exercise the `rm -rf` below against a
+# scratch tree instead of the build machine's own /usr/src and /var/lib/dkms.
+GA_USR_SRC=${GA_USR_SRC:-/usr/src}
+GA_DKMS_STATE=${GA_DKMS_STATE:-/var/lib/dkms}
+
 ga_msg()  { echo "$PKG: $*"; }
 ga_warn() { echo "$PKG: warning: $*" >&2; }
 
@@ -100,6 +106,11 @@ ga_install() {
 	if dkms status -m "$PKG" -v "$VER" 2>/dev/null | grep -q .; then
 		dkms remove -m "$PKG" -v "$VER" --all >/dev/null 2>&1 || true
 	fi
+	# `dkms remove` refuses to unregister a version whose sources are gone ("Missing the module
+	# source directory ... Manual intervention is required!") and leaves its state directory
+	# behind; `dkms add` then fails on the leftover. dpkg/rpm have just unpacked this exact
+	# version's sources, so whatever the old state directory holds is stale by construction.
+	rm -rf "$GA_DKMS_STATE/$PKG/$VER"
 
 	# Also drop OTHER versions of this module that no package owns. The pre-packaging installer
 	# registered a bare "1.0" straight into /usr/src, and a guest that ran it still has that
@@ -109,12 +120,31 @@ ga_install() {
 	# dkms 3.x prints "name/version, kernel, arch: state"; 2.x prints "name, version, kernel, ...".
 	# Stripping the name with either separator and then everything from the next , or : leaves the
 	# version under both.
-	for other in $(dkms status -m "$PKG" 2>/dev/null \
-	               | sed -e "s|^$PKG[/,] *||" -e 's|[,:].*||' | sort -u); do
+	#
+	# Enumerate from the state DIRECTORY as well as from `dkms status`, and take the directory out
+	# along with the registration. Unregistering alone is what defect D4 was: an upgrade of this
+	# package printed "removing unowned dkms registration <pkg>/<old>" and `dkms status` still
+	# reported "<pkg>/<old>: broken ... Missing the module source directory ... Manual intervention
+	# is required!" afterwards, because `dkms remove` cannot act on a version whose sources the old
+	# package's own removal already deleted, and $GA_DKMS_STATE/$PKG/<old> survived it. The
+	# leftover is not cosmetic: it is reported as broken for the life of the guest and it is what
+	# `dkms autoinstall` trips over on the next kernel upgrade.
+	for other in $({ dkms status -m "$PKG" 2>/dev/null \
+	                   | sed -e "s|^$PKG[/,] *||" -e 's|[,:].*||'
+	                 ls "$GA_DKMS_STATE/$PKG" 2>/dev/null; } | sort -u); do
 		[ -n "$other" ] && [ "$other" != "$VER" ] || continue
-		ga_msg "removing unowned dkms registration $PKG/$other"
+		# kernel-<ver>-<arch> are dkms's own symlinks into the version directories, not versions.
+		case "$other" in kernel-*) continue ;; esac
+		ga_msg "removing stale dkms registration $PKG/$other"
 		dkms remove -m "$PKG" -v "$other" --all >/dev/null 2>&1 || true
-		rm -rf "/usr/src/$PKG-$other"
+		rm -rf "$GA_USR_SRC/$PKG-$other" "$GA_DKMS_STATE/$PKG/$other"
+	done
+	# Those version directories were the targets of dkms's kernel-<ver>-<arch> convenience
+	# symlinks; a dangling one makes `dkms status` complain in its own right.
+	for link in "$GA_DKMS_STATE/$PKG"/kernel-*; do
+		if [ -L "$link" ] && [ ! -e "$link" ]; then
+			rm -f "$link"
+		fi
 	done
 
 	dkms add -m "$PKG" -v "$VER" || {

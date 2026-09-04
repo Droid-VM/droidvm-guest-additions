@@ -44,7 +44,14 @@ BIN=$TMP/bin; mkdir -p "$BIN"
 #
 # hooks.sh needs exactly these real utilities; linking them in by absolute path keeps the rest of
 # the system out of reach.
-for u in uname grep sed sort; do ln -sf "$(command -v $u)" "$BIN/$u"; done
+for u in uname grep sed sort ls rm; do ln -sf "$(command -v $u)" "$BIN/$u"; done
+
+# ga_install deletes stale dkms trees with `rm -rf`. Those paths are absolute in a real install,
+# so the test points them at a scratch tree -- the same reason the stubs exist at all: a test for
+# "what would we delete" must not be able to delete the build machine's /usr/src or /var/lib/dkms.
+export GA_USR_SRC="$TMP/usr/src"
+export GA_DKMS_STATE="$TMP/var/lib/dkms"
+mkdir -p "$GA_USR_SRC" "$GA_DKMS_STATE"
 
 # hooks.sh as the package would ship it: placeholders substituted.
 VERSTR='1.0+test'
@@ -96,6 +103,53 @@ EOF
     check "removes the stray 1.0 (${fmt%%,*}...)" "dkms remove -m droidvm-guest-additions -v 1.0 --all" "$TMP/calls"
     check_absent "and leaves its own (unregistered) version alone" "-v 1.0+test --all" "$TMP/calls"
 done
+
+echo "== A stale dkms state directory is removed, not just unregistered (defect D4) =="
+# What an upgrade of this package left behind: the old version's sources are gone (dpkg deleted
+# them with the old package), so `dkms remove` fails with "Missing the module source directory"
+# and only the registration line is printed -- while /var/lib/dkms/<pkg>/<old> survives and
+# `dkms status` reports it as "broken ... Manual intervention is required!" from then on.
+OLD=1.0+droidvm.r13.gcccd9078
+mkdir -p "$GA_DKMS_STATE/droidvm-guest-additions/$OLD/build"
+: > "$GA_DKMS_STATE/droidvm-guest-additions/$OLD/build/make.log"
+ln -sfn "$OLD/7.0.0-30-generic/aarch64" \
+        "$GA_DKMS_STATE/droidvm-guest-additions/kernel-7.0.0-30-generic-aarch64"
+cat > "$BIN/dkms" <<EOF
+#!/bin/sh
+echo "dkms \$*" >> "$TMP/calls"
+# The broken entry is what `dkms status` reports for a version whose sources are missing; the
+# remove that would clear it fails, exactly as it does on the guest.
+[ "\$*" = "status -m droidvm-guest-additions" ] && \
+    echo "droidvm-guest-additions/$OLD: broken. Missing the module source directory"
+case "\$*" in *"remove -m droidvm-guest-additions -v $OLD"*) exit 1 ;; esac
+exit 0
+EOF
+chmod +x "$BIN/dkms"
+stub modinfo 0; stub update-initramfs 0
+run_case ga_install
+check "still unregisters the stale version" \
+      "dkms remove -m droidvm-guest-additions -v $OLD --all" "$TMP/calls"
+if [ -e "$GA_DKMS_STATE/droidvm-guest-additions/$OLD" ]; then
+    bad "leaves $GA_DKMS_STATE/droidvm-guest-additions/$OLD behind (this is defect D4)"
+else ok "removes the stale state directory"; fi
+if [ -L "$GA_DKMS_STATE/droidvm-guest-additions/kernel-7.0.0-30-generic-aarch64" ]; then
+    bad "leaves a dangling kernel-* symlink behind"
+else ok "removes the dangling kernel-* symlink"; fi
+check_absent "never treats a kernel-* symlink as a version" \
+      "-v kernel-7.0.0-30-generic-aarch64" "$TMP/calls"
+
+echo "== A stale state directory with no registration at all is still removed =="
+# `dkms status` says nothing (dkms 3.x skips a tree it cannot parse), so enumerating the status
+# output alone would never see this one; the directory listing is what finds it.
+ORPHAN=1.0+droidvm.r12.gdeadbee
+mkdir -p "$GA_DKMS_STATE/droidvm-guest-additions/$ORPHAN"
+mkdir -p "$GA_USR_SRC/droidvm-guest-additions-$ORPHAN"
+stub dkms 0; stub modinfo 0; stub update-initramfs 0
+run_case ga_install
+if [ -e "$GA_DKMS_STATE/droidvm-guest-additions/$ORPHAN" ] ||
+   [ -e "$GA_USR_SRC/droidvm-guest-additions-$ORPHAN" ]; then
+    bad "an unregistered leftover tree survives ga_install"
+else ok "removes an unregistered leftover tree"; fi
 
 echo "== Debian: removal rebuilds the initramfs for the RUNNING kernel =="
 stub dkms 0; stub update-initramfs 0
