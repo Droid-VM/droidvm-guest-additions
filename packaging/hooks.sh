@@ -133,8 +133,12 @@ ga_install() {
 	                   | sed -e "s|^$PKG[/,] *||" -e 's|[,:].*||'
 	                 ls "$GA_DKMS_STATE/$PKG" 2>/dev/null; } | sort -u); do
 		[ -n "$other" ] && [ "$other" != "$VER" ] || continue
-		# kernel-<ver>-<arch> are dkms's own symlinks into the version directories, not versions.
-		case "$other" in kernel-*) continue ;; esac
+		# Not every name under $GA_DKMS_STATE/$PKG is a version. kernel-<ver>-<arch> are dkms's
+		# own symlinks into the version directories, and original_module holds the IN-TREE
+		# modules dkms moved aside to install ours -- deleting that is how a later
+		# `dkms remove` leaves the guest with no virtio-gpu at all, since the kernel package's
+		# own copies are no longer where it put them.
+		case "$other" in kernel-*|original_module) continue ;; esac
 		ga_msg "removing stale dkms registration $PKG/$other"
 		dkms remove -m "$PKG" -v "$other" --all >/dev/null 2>&1 || true
 		rm -rf "$GA_USR_SRC/$PKG-$other" "$GA_DKMS_STATE/$PKG/$other"

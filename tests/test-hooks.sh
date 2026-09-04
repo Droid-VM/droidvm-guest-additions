@@ -114,11 +114,17 @@ mkdir -p "$GA_DKMS_STATE/droidvm-guest-additions/$OLD/build"
 : > "$GA_DKMS_STATE/droidvm-guest-additions/$OLD/build/make.log"
 ln -sfn "$OLD/7.0.0-30-generic/aarch64" \
         "$GA_DKMS_STATE/droidvm-guest-additions/kernel-7.0.0-30-generic-aarch64"
+# dkms keeps the displaced IN-TREE modules here, not a version. Removing it is how a later
+# `dkms remove` leaves the guest with no virtio-gpu at all: the kernel package's own copies were
+# moved out of /lib/modules/<ver>/kernel/... to make room for ours and this is where they went.
+mkdir -p "$GA_DKMS_STATE/droidvm-guest-additions/original_module/7.0.0-30-generic/aarch64"
+: > "$GA_DKMS_STATE/droidvm-guest-additions/original_module/7.0.0-30-generic/aarch64/virtio-gpu.ko.zst"
 cat > "$BIN/dkms" <<EOF
 #!/bin/sh
 echo "dkms \$*" >> "$TMP/calls"
-# The broken entry is what `dkms status` reports for a version whose sources are missing; the
-# remove that would clear it fails, exactly as it does on the guest.
+# The broken entry is what dkms status reports for a version whose sources are missing; the
+# remove that would clear it fails, exactly as it does on the guest. (No backticks in here: the
+# heredoc is unquoted, so a command substitution in a comment would still run.)
 [ "\$*" = "status -m droidvm-guest-additions" ] && \
     echo "droidvm-guest-additions/$OLD: broken. Missing the module source directory"
 case "\$*" in *"remove -m droidvm-guest-additions -v $OLD"*) exit 1 ;; esac
@@ -137,6 +143,10 @@ if [ -L "$GA_DKMS_STATE/droidvm-guest-additions/kernel-7.0.0-30-generic-aarch64"
 else ok "removes the dangling kernel-* symlink"; fi
 check_absent "never treats a kernel-* symlink as a version" \
       "-v kernel-7.0.0-30-generic-aarch64" "$TMP/calls"
+check_absent "never treats original_module as a version" "-v original_module" "$TMP/calls"
+if [ -e "$GA_DKMS_STATE/droidvm-guest-additions/original_module/7.0.0-30-generic/aarch64/virtio-gpu.ko.zst" ]; then
+    ok "leaves the displaced in-tree modules in original_module alone"
+else bad "deleted original_module: a later dkms remove has no in-tree virtio-gpu to restore"; fi
 
 echo "== A stale state directory with no registration at all is still removed =="
 # `dkms status` says nothing (dkms 3.x skips a tree it cannot parse), so enumerating the status
