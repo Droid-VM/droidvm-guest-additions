@@ -352,12 +352,125 @@ out:
 }
 
 /**
+ * struct virtio_media_ctrl_bounce - One control payload routed through a
+ * driver-owned bounce buffer (defect D34, B7-controls §9).
+ *
+ * The payload of a compound control is an ordinary guest user-space page:
+ * outside every access window a pool-mode host helper may touch, so handing
+ * its pinned pages to the host EFAULTs in both directions. Instead the
+ * payload travels through @bounce -- media_guest pool memory when there is a
+ * pool, a plain kernel buffer otherwise -- copied from user space before the
+ * ioctl and back after it.
+ *
+ * @bounce: the driver-owned memory the host sees.
+ * @uptr: the user-space payload pointer as submitted, kept here because the
+ *	control array is overwritten with the host's echo of it before the
+ *	copy-out.
+ */
+struct virtio_media_ctrl_bounce {
+	struct vmedia_bounce *bounce;
+	u64 uptr;
+};
+
+/**
+ * Allocate and fill a bounce buffer for every control of @ctrls that carries
+ * a payload. Returns NULL when no control does, an ERR_PTR on failure, and
+ * the bounce array (indexed per control, of @ctrls->count entries) otherwise.
+ */
+static struct virtio_media_ctrl_bounce *
+virtio_media_bounce_in_ext_ctrls(struct virtio_media *vv,
+				 const struct v4l2_ext_controls *ctrls)
+{
+	struct virtio_media_ctrl_bounce *bounces;
+	bool any = false;
+	int ret;
+	u32 i;
+
+	for (i = 0; i < ctrls->count; i++)
+		any |= ctrls->controls[i].size > 0;
+	if (!any)
+		return NULL;
+
+	bounces = kvcalloc(ctrls->count, sizeof(*bounces), GFP_KERNEL);
+	if (!bounces)
+		return ERR_PTR(-ENOMEM);
+
+	for (i = 0; i < ctrls->count; i++) {
+		const struct v4l2_ext_control *ctrl = &ctrls->controls[i];
+		struct vmedia_bounce *bounce;
+
+		if (ctrl->size == 0)
+			continue;
+
+		bounce = vmedia_bounce_alloc(vv, ctrl->size);
+		if (IS_ERR(bounce)) {
+			ret = PTR_ERR(bounce);
+			goto err_free;
+		}
+		bounces[i].bounce = bounce;
+		bounces[i].uptr = (u64)(uintptr_t)ctrl->ptr;
+
+		/*
+		 * Copied in whatever the direction: S/TRY need the data, G
+		 * overwrites it, and an unreadable pointer is -EFAULT for
+		 * all three, exactly as if the host had been handed the
+		 * pages themselves.
+		 */
+		if (copy_from_user(bounce->vaddr, (void __user *)ctrl->ptr,
+				   ctrl->size)) {
+			ret = -EFAULT;
+			goto err_free;
+		}
+	}
+
+	return bounces;
+
+err_free:
+	for (i = 0; i < ctrls->count; i++)
+		vmedia_bounce_free(bounces[i].bounce);
+	kvfree(bounces);
+	return ERR_PTR(ret);
+}
+
+/**
+ * Copy every bounced payload back to user space (the host writes updated or
+ * requested values into the bounce, whatever the ioctl direction) and free
+ * the array. @copy_back is false when the host was never reached, in which
+ * case user memory is left untouched.
+ *
+ * Returns 0 or -EFAULT.
+ */
+static int virtio_media_bounce_out_ext_ctrls(
+	struct virtio_media_ctrl_bounce *bounces, u32 count, bool copy_back)
+{
+	int ret = 0;
+	u32 i;
+
+	if (!bounces)
+		return 0;
+
+	for (i = 0; i < count; i++) {
+		struct vmedia_bounce *bounce = bounces[i].bounce;
+
+		if (!bounce)
+			continue;
+		if (copy_back &&
+		    copy_to_user((void __user *)(uintptr_t)bounces[i].uptr,
+				 bounce->vaddr, bounce->len))
+			ret = -EFAULT;
+		vmedia_bounce_free(bounce);
+	}
+	kvfree(bounces);
+
+	return ret;
+}
+
+/**
  * Queues an ioctl that sends a v4l2_ext_controls to the host and receives an updated version.
  *
  * v4l2_ext_controls has a pointer to an array of v4l2_ext_control, and also
- * potentially pointers to user-space memory that we need to map properly,
- * hence the dedicated function.
- *
+ * potentially pointers to user-space memory that we need to map properly --
+ * through bounce buffers, see above -- hence the dedicated function.
  */
 static int virtio_media_send_ext_controls_ioctl(struct v4l2_fh *fh,
 						u32 ioctl_code,
@@ -369,6 +482,9 @@ static int virtio_media_send_ext_controls_ioctl(struct v4l2_fh *fh,
 	size_t num_cmd_sgs;
 	struct v4l2_ext_control *controls_backup = ctrls->controls;
 	const u32 num_ctrls = ctrls->count;
+	struct virtio_media_ctrl_bounce *bounces = NULL;
+	struct vmedia_bounce **bounce_ptrs = NULL;
+	bool sent = false;
 	struct scatterlist *sgs[64];
 	struct scatterlist_filler filler = {
 		.descs = session->command_sgs.sgl,
@@ -382,36 +498,59 @@ static int virtio_media_send_ext_controls_ioctl(struct v4l2_fh *fh,
 		.cur_sg = 0,
 	};
 	size_t resp_len = 0;
+	int bounce_ret;
 	int ret;
+	u32 i;
+
+	/* Control payloads travel through driver-owned bounces (D34). */
+	if (num_ctrls > 0 && ctrls->controls) {
+		bounces = virtio_media_bounce_in_ext_ctrls(vv, ctrls);
+		if (IS_ERR(bounces))
+			return PTR_ERR(bounces);
+		if (bounces) {
+			bounce_ptrs = kvcalloc(num_ctrls,
+					       sizeof(*bounce_ptrs),
+					       GFP_KERNEL);
+			if (!bounce_ptrs) {
+				ret = -ENOMEM;
+				goto out;
+			}
+			for (i = 0; i < num_ctrls; i++)
+				bounce_ptrs[i] = bounces[i].bounce;
+		}
+	}
 
 	/* Command descriptor */
 	ret = scatterlist_filler_add_ioctl_cmd(&filler, session, ioctl_code);
 	if (ret)
-		return ret;
+		goto out;
 
-	/* v4l2_controls and its pointees */
-	ret = scatterlist_filler_add_ext_ctrls(&filler, ctrls, true);
+	/* v4l2_controls and the bounced payloads they point to */
+	ret = scatterlist_filler_add_ext_ctrls(&filler, ctrls, true,
+					       bounce_ptrs);
 	if (ret)
-		return ret;
+		goto out;
 
 	num_cmd_sgs = filler.cur_sg;
 
 	/* Response descriptor */
 	ret = scatterlist_filler_add_ioctl_resp(&filler, session);
 	if (ret)
-		return ret;
+		goto out;
 
 	/*
-	 * Response payload (same as input but without userptrs)
+	 * Response payload (same as input but without payloads: the host
+	 * writes those into the bounces directly)
 	 */
-	ret = scatterlist_filler_add_ext_ctrls(&filler, ctrls, false);
+	ret = scatterlist_filler_add_ext_ctrls(&filler, ctrls, false, NULL);
 	if (ret)
-		return ret;
+		goto out;
 
 	ret = virtio_media_send_command(
 		vv, filler.sgs, num_cmd_sgs, filler.cur_sg - num_cmd_sgs,
 		sizeof(struct virtio_media_resp_ioctl) + sizeof(*ctrls),
 		&resp_len);
+	sent = true;
 
 	/* Just in case the host touched these. */
 	ctrls->controls = controls_backup;
@@ -420,8 +559,10 @@ static int virtio_media_send_ext_controls_ioctl(struct v4l2_fh *fh,
 			&vv->v4l2_dev,
 			"device returned a number of extended controls different than submitted\n");
 	}
-	if (ctrls->count > num_ctrls)
-		return -ENOSPC;
+	if (ctrls->count > num_ctrls) {
+		ret = -ENOSPC;
+		goto out;
+	}
 
 	/* Event if we have received an error, we may need to read our payload back */
 	if (ret < 0 && resp_len >= sizeof(struct virtio_media_resp_ioctl) +
@@ -430,22 +571,37 @@ static int virtio_media_send_ext_controls_ioctl(struct v4l2_fh *fh,
 		scatterlist_filler_retrieve_ext_ctrls(
 			session, &sgs[num_cmd_sgs + 1],
 			filler.cur_sg - (num_cmd_sgs + 1), ctrls);
-		return ret;
+		goto out;
 	}
+
+	if (ret < 0)
+		goto out;
 
 	resp_len -= sizeof(struct virtio_media_resp_ioctl);
 
 	/* Make sure that the reply's length covers our v4l2_ext_controls */
-	if (resp_len < sizeof(*ctrls))
-		return -EINVAL;
+	if (resp_len < sizeof(*ctrls)) {
+		ret = -EINVAL;
+		goto out;
+	}
 
 	ret = scatterlist_filler_retrieve_ext_ctrls(
 		session, &sgs[num_cmd_sgs + 1],
 		filler.cur_sg - (num_cmd_sgs + 1), ctrls);
-	if (ret)
-		return ret;
 
-	return 0;
+out:
+	/*
+	 * Once the host has answered, the bounces carry the payloads user
+	 * space must see -- on success and on error alike, since an EXT_CTRLS
+	 * error reply still updates the input (error_idx, adjusted values).
+	 */
+	bounce_ret = virtio_media_bounce_out_ext_ctrls(bounces, num_ctrls,
+						       sent);
+	kvfree(bounce_ptrs);
+	ctrls->controls = controls_backup;
+	if (bounce_ret && !ret)
+		ret = bounce_ret;
+	return ret;
 }
 
 /**
@@ -578,7 +734,6 @@ SIMPLE_W_IOCTL(s_modulator, VIDIOC_S_MODULATOR, const struct v4l2_modulator)
 SIMPLE_WR_IOCTL(g_selection, VIDIOC_G_SELECTION, struct v4l2_selection)
 SIMPLE_WR_IOCTL(s_selection, VIDIOC_S_SELECTION, struct v4l2_selection)
 SIMPLE_R_IOCTL(g_enc_index, VIDIOC_G_ENC_INDEX, struct v4l2_enc_idx)
-SIMPLE_WR_IOCTL(encoder_cmd, VIDIOC_ENCODER_CMD, struct v4l2_encoder_cmd)
 SIMPLE_WR_IOCTL(try_encoder_cmd, VIDIOC_TRY_ENCODER_CMD,
 		struct v4l2_encoder_cmd)
 SIMPLE_WR_IOCTL(try_decoder_cmd, VIDIOC_TRY_DECODER_CMD,
@@ -764,6 +919,12 @@ static int virtio_media_streamon(struct file *file, void *priv_unused,
 		return ret;
 
 	session->queues[i].streaming = true;
+	/*
+	 * STREAMON ends the EPIPE-after-LAST drain state alongside
+	 * STREAMOFF and the *_CMD_START commands (dev-decoder.rst "Drain":
+	 * "until the client issues any of the following operations"), D27b.
+	 */
+	session->queues[i].is_capture_last = false;
 
 	return 0;
 }
@@ -1494,6 +1655,40 @@ static int virtio_media_decoder_cmd(struct file *file, void *priv_unused,
 }
 
 /*
+ * encoder_cmd affects the CAPTURE queue the same way (dev-encoder.rst
+ * "Drain": ENC_CMD_START resumes a queue parked by a dequeued LAST buffer);
+ * without this the driver kept answering -EPIPE after an encoder drain until
+ * STREAMOFF, stalling clients that restart with ENC_CMD_START (D27b's
+ * encoder-side twin, D40/D43 root).
+ */
+static int virtio_media_encoder_cmd(struct file *file, void *priv_unused,
+				    struct v4l2_encoder_cmd *cmd)
+{
+	struct v4l2_fh *fh = file->private_data;
+	struct virtio_media_session *session;
+	int ret;
+
+	if (!fh)
+		return -ENODEV;
+	session = fh_to_session(fh);
+
+	ret = virtio_media_send_wr_ioctl(fh, VIDIOC_ENCODER_CMD, cmd,
+					 sizeof(*cmd), sizeof(*cmd));
+	if (ret)
+		return ret;
+
+	/* A START command makes the CAPTURE queue able to dequeue again. */
+	if (cmd->cmd == V4L2_ENC_CMD_START) {
+		session->queues[V4L2_BUF_TYPE_VIDEO_CAPTURE].is_capture_last =
+			false;
+		session->queues[V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE]
+			.is_capture_last = false;
+	}
+
+	return 0;
+}
+
+/*
  * s_std doesn't work with a pointer, so we cannot use SIMPLE_W_IOCTL.
  */
 
@@ -1720,6 +1915,23 @@ long virtio_media_device_ioctl(struct file *file, unsigned int cmd,
 	/* The host closed this session after an error: nothing can go through. */
 	if (READ_ONCE(fh_to_session(vfh)->dead))
 		return -ENODEV;
+
+	/*
+	 * A blocking VIDIOC_DQEVENT sleeps in v4l2_event_dequeue() until an
+	 * event arrives. It never talks to the host -- it only reads the
+	 * v4l2 event queue under vdev->fh_lock, filled by
+	 * virtio_media_process_events() from the event work, which does not
+	 * take vlock either. Dispatch it without the device lock, the way
+	 * virtio_media_dqbuf() already drops vlock around its own wait:
+	 * holding vlock across the sleep wedged every other ioctl and every
+	 * open() of the node behind one waiter, including the very setter
+	 * that would have produced the awaited event (defect D35,
+	 * B7-controls §12.1). SUBSCRIBE/UNSUBSCRIBE_EVENT stay under vlock:
+	 * they only wait for the host's bounded command response, never for
+	 * guest-side activity.
+	 */
+	if (cmd == VIDIOC_DQEVENT)
+		return video_ioctl2(file, cmd, arg);
 
 	mutex_lock(&vv->vlock);
 
