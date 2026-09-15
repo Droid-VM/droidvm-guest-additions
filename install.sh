@@ -8,11 +8,13 @@
 # Installs the gunyah_guest + patched virtio-gpu modules as a DKMS package
 # (auto-rebuilds on kernel upgrades) and refreshes the initramfs so early KMS
 # picks up the patched driver. Optionally installs a guest mesa if
-# DROIDVM_MESA_URL is set.
+# DROIDVM_MESA_URL is set, and the VA-API backend if DROIDVM_VA_URL is set.
 #
 # Env overrides: DROIDVM_GA_REPO (owner/repo), DROIDVM_GA_REF (branch/tag),
 # DROIDVM_MESA_URL (a mesa-guest-<variant>_<ver>_arm64.deb, or a legacy
-# mesa-guest tarball -- either a URL or a local path).
+# mesa-guest tarball -- either a URL or a local path),
+# DROIDVM_VA_URL (a libva-v4l2_<ver>_arm64.deb from 10_build_guest_va.sh --
+# the VA-API backend, again a URL or a local path).
 set -euo pipefail
 
 REPO="${DROIDVM_GA_REPO:-Droid-VM/droidvm-guest-additions}"
@@ -145,6 +147,38 @@ if [ -n "${DROIDVM_MESA_URL:-}" ]; then
 		ldconfig
 		;;
 	esac
+fi
+
+# The VA-API backend (Droid-VM/libva-v4l2, built by the meta repo's 10_build_guest_va.sh).
+# Exactly parallel to DROIDVM_MESA_URL above, and for the same reason: everything a guest needs
+# arrives from dist-guest/, through one installer.
+#
+# Only VA-API clients care -- Chromium/Firefox, mpv --hwdec=vaapi, ffmpeg -hwaccel vaapi,
+# GStreamer's va* elements. ffmpeg h264_v4l2m2m and gst v4l2videodec talk to /dev/videoN
+# directly and neither need this package nor change behaviour when it is installed.
+#
+# dpkg -i and then `apt-get -f install`, rather than apt-get install straight away: this is a
+# single standalone .deb with no repository behind it, and on a guest missing one of its runtime
+# libraries (libva2, libva-drm2, libudev1) apt-get install of a local file reports the unmet
+# dependency and stops. The pair installs the package and then lets apt pull what it needs.
+if [ -n "${DROIDVM_VA_URL:-}" ]; then
+	msg "installing the VA-API backend from $DROIDVM_VA_URL"
+	case "$DROIDVM_VA_URL" in
+	*.deb) ;;
+	*) die "DROIDVM_VA_URL must be a .deb (got $DROIDVM_VA_URL)" ;;
+	esac
+	f=$tmp/libva-v4l2.deb
+	case "$DROIDVM_VA_URL" in
+	http*) curl -fL "$DROIDVM_VA_URL" -o "$f" ;;
+	*)     cp "$DROIDVM_VA_URL" "$f" ;;
+	esac
+	dpkg -i "$f" || apt-get -f install -y
+	# /etc/profile.d is read by LOGIN shells only. This shell is not one, and neither is a
+	# systemd service -- so say where the environment does and does not arrive rather than
+	# leave the next person to discover it through a driver that "does not load".
+	msg "installed; LIBVA_DRIVER_NAME=v4l2 arrives at the NEXT login shell"
+	echo "    this session:    . /etc/profile.d/droidvm-va.sh"
+	echo "    a systemd unit:  Environment=LIBVA_DRIVER_NAME=v4l2 (profile.d does not reach it)"
 fi
 
 inst=$(modinfo -F filename virtio_gpu 2>/dev/null || true)

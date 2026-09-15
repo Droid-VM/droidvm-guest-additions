@@ -41,6 +41,25 @@ or local path), or a legacy tarball. Prefer the deb -- the two variants install
 to the same prefix and Conflict, so dpkg refuses the second one instead of
 silently replacing the first one's libgallium.
 
+`DROIDVM_VA_URL` additionally installs the **VA-API backend**: a
+`libva-v4l2_<ver>_arm64.deb` from the meta repo's `10_build_guest_va.sh` (URL
+or local path; a `.deb` only, there is no tarball form). It ships
+`/usr/lib/aarch64-linux-gnu/dri/v4l2_drv_video.so` plus
+`/etc/profile.d/droidvm-va.sh`, which exports `LIBVA_DRIVER_NAME=v4l2` and
+`GST_VAAPI_ALL_DRIVERS=1`. Without that first variable libva asks DRM for the
+driver's name, gets `virtio_gpu`, looks for a `virtio_gpu_drv_video.so` that
+does not exist in this guest, and every VA-API client silently decodes in
+software. Installed with `dpkg -i` and then `apt-get -f install`: it is a
+standalone file with no repository behind it.
+
+Two things `profile.d` does **not** reach: the shell that ran the installer
+(`. /etc/profile.d/droidvm-va.sh` for this session) and systemd services, which
+need their own `Environment=LIBVA_DRIVER_NAME=v4l2`. Nothing that speaks V4L2
+M2M directly — `ffmpeg -c:v h264_v4l2m2m`, `gst v4l2videodec` — needs this
+package or changes behaviour when it is installed.
+
+    DROIDVM_VA_URL=./libva-v4l2_0+droidvm.r367.g74b336a4_arm64.deb sudo ./install.sh
+
 Manual DKMS route (what install.sh automates):
 
     sudo cp -r . /usr/src/droidvm-guest-additions-1.0
