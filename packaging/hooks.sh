@@ -99,8 +99,57 @@ ga_add_render_groups() {
 	return 0
 }
 
+# Make the greeter readable when its theme's wallpaper is not on the image.
+#
+# The appliance's SDDM themes (ubuntu-theme, ubuntu-budgie-login) point `background=` at a
+# wallpaper package that is not installed, and set `use-background-color=false`, so the fallback
+# colour is never painted either. The greeter then draws on the bare X root -- white -- with a
+# transparent password field whose text and dots default to #FFFFFF: the user types the password,
+# the field takes it, and nothing is visible (E2E-vpu P-1, diagnosed in DIAG-P1). It is only an
+# appearance defect, but it looks like "the VM cannot be logged into", which is the first thing a
+# new user sees.
+#
+# SDDM merges <theme>/theme.conf.user over theme.conf, so the package drops one in that turns the
+# fallback colour on, for every section of every theme whose wallpaper is missing. The shipped
+# theme.conf is not edited (a later wallpaper package restores the intended look without a
+# conflict), a theme.conf.user that already exists is the administrator's and is left alone, and a
+# theme whose wallpaper IS present is not touched.
+GA_SDDM_THEMES=${GA_SDDM_THEMES:-/usr/share/sddm/themes}
+ga_fix_greeter_background() {
+	[ -d "$GA_SDDM_THEMES" ] || return 0
+	for conf in "$GA_SDDM_THEMES"/*/theme.conf; do
+		[ -f "$conf" ] || continue
+		[ -e "$conf.user" ] && continue
+		# Every `background=` path the theme names; the fix applies when at least one is absent.
+		missing=0
+		for bg in $(sed -n 's/^[[:space:]]*background[[:space:]]*=[[:space:]]*"\{0,1\}\([^"[:space:]]*\).*/\1/p' "$conf"); do
+			case "$bg" in /*) [ -e "$bg" ] || missing=1 ;; esac
+		done
+		[ "$missing" -eq 1 ] || continue
+		# Re-emit each section header once, followed by the override, for every section that
+		# disables the fallback colour. Section names differ between themes, so they are read
+		# rather than assumed.
+		user=$(awk '
+			/^[[:space:]]*\[/ { section = $0; printed = 0; next }
+			/^[[:space:]]*use-background-color[[:space:]]*=[[:space:]]*false/ {
+				if (!printed) { print section; printed = 1 }
+				print "use-background-color=true"
+			}' "$conf")
+		[ -n "$user" ] || continue
+		theme=$(basename "$(dirname "$conf")")
+		{
+			echo "# $PKG: the wallpaper this theme names is not installed; paint the fallback"
+			echo "# colour so the greeter (and the password field) is visible. Delete to undo."
+			echo "$user"
+		} > "$conf.user" 2>/dev/null && ga_msg "sddm theme $theme: wallpaper missing, enabling its fallback background colour"
+	done
+	# Cosmetic; never let it fail the install (see ga_add_render_groups).
+	return 0
+}
+
 ga_install() {
 	ga_add_render_groups
+	ga_fix_greeter_background
 
 	# Idempotent: a reinstall or a failed previous attempt must not wedge the tree.
 	if dkms status -m "$PKG" -v "$VER" 2>/dev/null | grep -q .; then

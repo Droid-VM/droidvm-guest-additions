@@ -231,6 +231,72 @@ run_case ga_install
 check "confirms when it IS the dkms copy"  "virtio_gpu resolves to /lib/modules" "$TMP/calls"
 check_absent "and does not warn then"      "expected .../updates/dkms/" "$TMP/calls"
 
+echo "== The greeter gets its fallback background when the theme's wallpaper is missing (P-1) =="
+# What the appliance image ships: two themes naming a wallpaper that is not installed, with the
+# fallback colour switched off in both screens; a third theme whose wallpaper exists; a fourth
+# with an administrator's own theme.conf.user. Paths are absolute in a real install, so the theme
+# directory is redirected to a scratch tree for the same reason the dkms paths are.
+export GA_SDDM_THEMES="$TMP/usr/share/sddm/themes"
+for t in ubuntu-theme ubuntu-budgie-login; do
+    mkdir -p "$GA_SDDM_THEMES/$t"
+    cat > "$GA_SDDM_THEMES/$t/theme.conf" <<'EOF'
+[General]
+scale = 1.0
+
+[LockScreen]
+background            = "/usr/share/backgrounds/budgie/budgie-codename.png"
+use-background-color  = false
+background-color      = "#2f343f"
+
+[LoginScreen]
+background            = "/usr/share/backgrounds/budgie/budgie-codename.png"
+use-background-color  = false
+background-color      = "#2f343f"
+EOF
+done
+mkdir -p "$GA_SDDM_THEMES/has-wallpaper" "$TMP/wall"
+: > "$TMP/wall/present.png"
+cat > "$GA_SDDM_THEMES/has-wallpaper/theme.conf" <<EOF
+[LoginScreen]
+background = "$TMP/wall/present.png"
+use-background-color = false
+EOF
+mkdir -p "$GA_SDDM_THEMES/admin-owned"
+cp "$GA_SDDM_THEMES/ubuntu-theme/theme.conf" "$GA_SDDM_THEMES/admin-owned/theme.conf"
+echo "[LoginScreen]" > "$GA_SDDM_THEMES/admin-owned/theme.conf.user"
+ln -sf "$(command -v awk)" "$BIN/awk"; ln -sf "$(command -v basename)" "$BIN/basename"
+ln -sf "$(command -v dirname)" "$BIN/dirname"
+stub dkms 0; stub update-initramfs 0; stub modinfo 0
+run_case ga_install
+for t in ubuntu-theme ubuntu-budgie-login; do
+    f="$GA_SDDM_THEMES/$t/theme.conf.user"
+    if [ -f "$f" ]; then ok "$t: theme.conf.user written"; else bad "$t: no theme.conf.user"; continue; fi
+    check "$t: lock screen section overridden"  "[LockScreen]"  "$f"
+    check "$t: login screen section overridden" "[LoginScreen]" "$f"
+    [ "$(grep -c '^use-background-color=true$' "$f")" -eq 2 ] \
+        && ok "$t: exactly the two disabled sections are turned on" \
+        || bad "$t: expected two use-background-color=true lines, got $(grep -c 'use-background-color' "$f")"
+    check_absent "$t: the General section is not touched" "[General]" "$f"
+    cmp -s "$GA_SDDM_THEMES/$t/theme.conf" "$GA_SDDM_THEMES/ubuntu-theme/theme.conf" \
+        && ok "$t: the shipped theme.conf is not edited" || bad "$t: theme.conf changed"
+done
+check "says which theme it fixed" "sddm theme ubuntu-budgie-login: wallpaper missing" "$TMP/calls"
+[ -e "$GA_SDDM_THEMES/has-wallpaper/theme.conf.user" ] \
+    && bad "a theme whose wallpaper exists got a drop-in" || ok "a theme whose wallpaper exists is left alone"
+[ "$(cat "$GA_SDDM_THEMES/admin-owned/theme.conf.user")" = "[LoginScreen]" ] \
+    && ok "an existing theme.conf.user is the administrator's and is kept" \
+    || bad "an existing theme.conf.user was overwritten"
+# Idempotent: a reinstall finds the drop-ins already there and changes nothing.
+before=$(cat "$GA_SDDM_THEMES/ubuntu-theme/theme.conf.user")
+run_case ga_install
+[ "$(cat "$GA_SDDM_THEMES/ubuntu-theme/theme.conf.user")" = "$before" ] \
+    && ok "a reinstall leaves the drop-in as it was" || bad "a reinstall rewrote the drop-in"
+check_absent "and does not report it again" "wallpaper missing" "$TMP/calls"
+# No theme directory at all (a headless guest): nothing happens, nothing fails.
+export GA_SDDM_THEMES="$TMP/no-such-dir"
+run_case ga_install
+check_absent "a guest without sddm is not touched" "sddm theme" "$TMP/calls"
+
 echo
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
