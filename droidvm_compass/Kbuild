@@ -1,0 +1,2 @@
+obj-m := droidvm-compass.o
+droidvm-compass-y := droidvm_compass.o

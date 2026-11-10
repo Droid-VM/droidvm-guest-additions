@@ -8,8 +8,10 @@ all:
 	$(MAKE) -C gunyah_guest KDIR=$(KDIR)
 	$(MAKE) -C virtio_gpu KDIR=$(KDIR)
 	$(MAKE) -C virtio_media KDIR=$(KDIR)
+	$(MAKE) -C droidvm_compass KDIR=$(KDIR)
 
 clean:
 	$(MAKE) -C gunyah_guest clean KDIR=$(KDIR)
 	$(MAKE) -C virtio_gpu clean KDIR=$(KDIR)
 	$(MAKE) -C virtio_media clean KDIR=$(KDIR)
+	$(MAKE) -C droidvm_compass clean KDIR=$(KDIR)

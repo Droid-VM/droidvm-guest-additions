@@ -1,6 +1,6 @@
 #!/bin/bash
 # Package the guest additions (virtio-gpu + gunyah_guest, i.e. the virtio-gunyah-accept transport,
-# + the virtio-media driver) as a DKMS source package, for both distro families:
+# + the virtio-media driver + the droidvm-compass IIO magnetometer) as a DKMS source package, for both distro families:
 #
 #   droidvm-guest-additions_<ver>_arm64.deb          Debian / Ubuntu
 #   droidvm-guest-additions-<ver>-1.aarch64.rpm      Fedora / RHEL
@@ -109,7 +109,7 @@ Maintainer: Droid-VM <noreply@github.com>
 Depends: dkms, gcc, make, kmod, linux-headers-generic | linux-headers-arm64
 Suggests: gpsd
 Description: DroidVM guest kernel modules (DKMS)
- Builds and installs three modules on the guest:
+ Builds and installs four modules on the guest:
  .
   * virtio-gpu   - the DroidVM virtio-gpu driver, which knows about the
                    host-owned and guest-owned memory pools the DT describes.
@@ -121,6 +121,9 @@ Description: DroidVM guest kernel modules (DKMS)
   * virtio-media - the V4L2 driver for DroidVM's virtio-media camera and
                    codec devices, allocating guest-filled buffers from the
                    media_guest pool.
+  * droidvm-compass - the magnetometer of DroidVM's motion sensors as an
+                   IIO compass (field and tilt-compensated heading), which
+                   iio-sensor-proxy reads as it reads a HID sensor hub's.
  .
  Sources are installed to /usr/src and built by dkms against the running
  kernel, and rebuilt automatically whenever the guest's kernel is upgraded.
@@ -208,7 +211,7 @@ Requires:       kmod
 Requires:       (kernel-devel-matched or kernel-devel)
 
 %description
-Builds and installs three modules on the guest:
+Builds and installs four modules on the guest:
 
  * virtio-gpu   - the DroidVM virtio-gpu driver, which knows about the
                   host-owned and guest-owned memory pools the DT describes.
@@ -220,6 +223,9 @@ Builds and installs three modules on the guest:
  * virtio-media - the V4L2 driver for DroidVM's virtio-media camera and
                   codec devices, allocating guest-filled buffers from the
                   media_guest pool.
+ * droidvm-compass - the magnetometer of DroidVM's motion sensors as an
+                  IIO compass (field and tilt-compensated heading), which
+                  iio-sensor-proxy reads as it reads a HID sensor hub's.
 
 Sources are installed to /usr/src and built by dkms against the running
 kernel, and rebuilt automatically whenever the guest's kernel is upgraded.
