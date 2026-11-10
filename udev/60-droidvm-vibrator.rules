@@ -1,0 +1,4 @@
+# DroidVM's vibrator: "DroidVM Vibrator" is the force-feedback (FF_RUMBLE) device droidvm-vibrator
+# makes for the host's virtio-input vibrator; mark it for feedbackd, which drives a phone's motor
+# from FEEDBACKD_TYPE=vibra (Phosh and other mobile shells).
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="DroidVM Vibrator", ENV{FEEDBACKD_TYPE}="vibra"

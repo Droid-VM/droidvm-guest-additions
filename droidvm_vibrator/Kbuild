@@ -1,0 +1,2 @@
+obj-m := droidvm-vibrator.o
+droidvm-vibrator-y := droidvm_vibrator.o

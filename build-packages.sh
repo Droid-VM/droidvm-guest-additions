@@ -1,6 +1,7 @@
 #!/bin/bash
 # Package the guest additions (virtio-gpu + gunyah_guest, i.e. the virtio-gunyah-accept transport,
-# + the virtio-media driver + the droidvm-compass IIO magnetometer) as a DKMS source package, for both distro families:
+# + the virtio-media driver + the droidvm-compass IIO magnetometer + the droidvm-vibrator rumble device)
+# as a DKMS source package, for both distro families:
 #
 #   droidvm-guest-additions_<ver>_arm64.deb          Debian / Ubuntu
 #   droidvm-guest-additions-<ver>-1.aarch64.rpm      Fedora / RHEL
@@ -89,6 +90,8 @@ sed -e "s/@PKG@/$PKG/g" -e "s/@VER@/$VER/g" packaging/hooks.sh \
 chmod 0644 "$STAGE/root/usr/libexec/$PKG/hooks.sh"
 # The GNSS receiver's udev rule: not a module, so it is installed rather than built.
 install -D -m 0644 udev/60-droidvm-gnss.rules "$STAGE/root/usr/lib/udev/rules.d/60-droidvm-gnss.rules"
+# And the vibrator's: FEEDBACKD_TYPE=vibra on the rumble device, for feedbackd.
+install -D -m 0644 udev/60-droidvm-vibrator.rules "$STAGE/root/usr/lib/udev/rules.d/60-droidvm-vibrator.rules"
 
 # ---------------------------------------------------------------------------
 # .deb
@@ -109,7 +112,7 @@ Maintainer: Droid-VM <noreply@github.com>
 Depends: dkms, gcc, make, kmod, linux-headers-generic | linux-headers-arm64
 Suggests: gpsd
 Description: DroidVM guest kernel modules (DKMS)
- Builds and installs four modules on the guest:
+ Builds and installs five modules on the guest:
  .
   * virtio-gpu   - the DroidVM virtio-gpu driver, which knows about the
                    host-owned and guest-owned memory pools the DT describes.
@@ -124,6 +127,8 @@ Description: DroidVM guest kernel modules (DKMS)
   * droidvm-compass - the magnetometer of DroidVM's motion sensors as an
                    IIO compass (field and tilt-compensated heading), which
                    iio-sensor-proxy reads as it reads a HID sensor hub's.
+  * droidvm-vibrator - DroidVM's vibrator as a force-feedback (FF_RUMBLE)
+                   input device that plays on the phone's motor.
  .
  Sources are installed to /usr/src and built by dkms against the running
  kernel, and rebuilt automatically whenever the guest's kernel is upgraded.
@@ -211,7 +216,7 @@ Requires:       kmod
 Requires:       (kernel-devel-matched or kernel-devel)
 
 %description
-Builds and installs four modules on the guest:
+Builds and installs five modules on the guest:
 
  * virtio-gpu   - the DroidVM virtio-gpu driver, which knows about the
                   host-owned and guest-owned memory pools the DT describes.
@@ -226,6 +231,8 @@ Builds and installs four modules on the guest:
  * droidvm-compass - the magnetometer of DroidVM's motion sensors as an
                   IIO compass (field and tilt-compensated heading), which
                   iio-sensor-proxy reads as it reads a HID sensor hub's.
+ * droidvm-vibrator - DroidVM's vibrator as a force-feedback (FF_RUMBLE)
+                  input device that plays on the phone's motor.
 
 Sources are installed to /usr/src and built by dkms against the running
 kernel, and rebuilt automatically whenever the guest's kernel is upgraded.
@@ -244,6 +251,7 @@ cp -a %{_sourcedir}/payload/. %{buildroot}/
 %dir /usr/libexec/%{pkgname}
 /usr/libexec/%{pkgname}/hooks.sh
 /usr/lib/udev/rules.d/60-droidvm-gnss.rules
+/usr/lib/udev/rules.d/60-droidvm-vibrator.rules
 
 %post
 . /usr/libexec/%{pkgname}/hooks.sh
