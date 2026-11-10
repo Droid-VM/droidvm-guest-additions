@@ -87,6 +87,8 @@ install -d -m 0755 "$STAGE/root/usr/libexec/$PKG"
 sed -e "s/@PKG@/$PKG/g" -e "s/@VER@/$VER/g" packaging/hooks.sh \
     > "$STAGE/root/usr/libexec/$PKG/hooks.sh"
 chmod 0644 "$STAGE/root/usr/libexec/$PKG/hooks.sh"
+# The GNSS receiver's udev rule: not a module, so it is installed rather than built.
+install -D -m 0644 udev/60-droidvm-gnss.rules "$STAGE/root/usr/lib/udev/rules.d/60-droidvm-gnss.rules"
 
 # ---------------------------------------------------------------------------
 # .deb
@@ -105,6 +107,7 @@ Architecture: arm64
 Installed-Size: $(du -sk "$root" | cut -f1)
 Maintainer: Droid-VM <noreply@github.com>
 Depends: dkms, gcc, make, kmod, linux-headers-generic | linux-headers-arm64
+Suggests: gpsd
 Description: DroidVM guest kernel modules (DKMS)
  Builds and installs three modules on the guest:
  .
@@ -121,6 +124,10 @@ Description: DroidVM guest kernel modules (DKMS)
  .
  Sources are installed to /usr/src and built by dkms against the running
  kernel, and rebuilt automatically whenever the guest's kernel is upgraded.
+ .
+ Also hands the DroidVM GNSS receiver (a virtio-console port streaming NMEA)
+ to gpsd when gpsd is installed: a udev rule, and a line in gpsd's local
+ AppArmor profile so it may open the port.
 EOF
 
     # linux-headers-generic is the META-package, and depending on it rather than on the versioned
@@ -217,6 +224,9 @@ Builds and installs three modules on the guest:
 Sources are installed to /usr/src and built by dkms against the running
 kernel, and rebuilt automatically whenever the guest's kernel is upgraded.
 
+Also hands the DroidVM GNSS receiver (a virtio-console port streaming NMEA)
+to gpsd when gpsd is installed: a udev rule (no SELinux policy change yet).
+
 %prep
 %build
 
@@ -227,6 +237,7 @@ cp -a %{_sourcedir}/payload/. %{buildroot}/
 /usr/src/%{pkgname}-$VER
 %dir /usr/libexec/%{pkgname}
 /usr/libexec/%{pkgname}/hooks.sh
+/usr/lib/udev/rules.d/60-droidvm-gnss.rules
 
 %post
 . /usr/libexec/%{pkgname}/hooks.sh

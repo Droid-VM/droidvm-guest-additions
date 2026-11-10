@@ -67,9 +67,13 @@ EOF
     chmod +x "$BIN/$1"
 }
 
+# The GNSS hook edits gpsd's AppArmor profile: point it at a scratch tree, never /etc. Exported,
+# so a case that sources hooks.sh without run_case cannot reach the real one either.
+AA=$TMP/apparmor.d
+export GA_AA_DIR="$AA"
 run_case() { # run_case <name> ; caller sets up stubs first
     : > "$TMP/calls"
-    ( PATH="$BIN"; . "$TMP/hooks.sh"; "$@" ) > "$TMP/out" 2>&1
+    ( PATH="$BIN"; GA_AA_DIR="$AA"; . "$TMP/hooks.sh"; "$@" ) > "$TMP/out" 2>&1
     cat "$TMP/out" >> "$TMP/calls"
 }
 
@@ -296,6 +300,22 @@ check_absent "and does not report it again" "wallpaper missing" "$TMP/calls"
 export GA_SDDM_THEMES="$TMP/no-such-dir"
 run_case ga_install
 check_absent "a guest without sddm is not touched" "sddm theme" "$TMP/calls"
+
+echo "== GNSS: gpsd's AppArmor profile gets the virtio-console ports, once, and loses them again =="
+mkdir -p "$AA/local"
+echo "/dev/ttyXYZ0 rw," > "$AA/local/usr.sbin.gpsd"   # an admin's own line, which must survive
+stub udevadm 0
+run_case ga_gnss_install
+run_case ga_gnss_install
+check "adds the vport rule"               "/dev/vport[0-9]*p[0-9]* rw," "$AA/local/usr.sbin.gpsd"
+[ "$(grep -c 'vport' "$AA/local/usr.sbin.gpsd")" -eq 1 ] && ok "only once" || bad "only once"
+check "re-triggers the ports for udev"    "udevadm trigger --subsystem-match=virtio-ports --action=add" "$TMP/calls"
+run_case ga_gnss_remove
+check_absent "removal takes it back"       "vport" "$AA/local/usr.sbin.gpsd"
+check "and leaves the admin's line"       "/dev/ttyXYZ0 rw," "$AA/local/usr.sbin.gpsd"
+rm -rf "$AA"
+run_case ga_gnss_install
+[ ! -e "$AA" ] && ok "no AppArmor, nothing written" || bad "no AppArmor, nothing written"
 
 echo
 echo "$PASS passed, $FAIL failed"

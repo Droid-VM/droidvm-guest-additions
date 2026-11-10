@@ -147,9 +147,53 @@ ga_fix_greeter_background() {
 	return 0
 }
 
+# The GNSS receiver (udev/60-droidvm-gnss.rules) needs no module, but gpsd only reads it if its
+# AppArmor profile lets it open the port: Ubuntu's lists ttys, pps and rfcomm, and a virtio-console
+# port is /dev/vportNpM (the udev symlink does not help, AppArmor checks the real node). The profile
+# includes local/usr.sbin.gpsd for exactly this, so the rule goes there, between markers that let
+# ga_gnss_remove take back only what it added. gpsd itself is optional: a guest without it has the
+# port and no reader, and gets the profile line ready for when gpsd is installed.
+# GA_AA_DIR is for tests/test-hooks.sh, which must not touch the machine it runs on.
+GA_AA_DIR=${GA_AA_DIR:-/etc/apparmor.d}
+GA_AA_LOCAL=$GA_AA_DIR/local/usr.sbin.gpsd
+GA_AA_BEGIN="# BEGIN @PKG@: the DroidVM GNSS receiver is a virtio-console port"
+GA_AA_END="# END @PKG@"
+
+ga_gnss_reload() {
+	if [ -f "$GA_AA_DIR/usr.sbin.gpsd" ] && command -v apparmor_parser >/dev/null 2>&1 \
+	   && [ -d /sys/kernel/security/apparmor ]; then
+		apparmor_parser -r "$GA_AA_DIR/usr.sbin.gpsd" 2>/dev/null \
+			|| ga_warn "could not reload gpsd's AppArmor profile"
+	fi
+	if command -v udevadm >/dev/null 2>&1; then
+		udevadm control --reload 2>/dev/null || true
+		# A port that is already there gets the rule now, not at the next boot.
+		udevadm trigger --subsystem-match=virtio-ports --action=add 2>/dev/null || true
+	fi
+}
+
+ga_gnss_install() {
+	if [ -d "$GA_AA_DIR" ] && ! grep -qxF "$GA_AA_BEGIN" "$GA_AA_LOCAL" 2>/dev/null; then
+		[ -d "${GA_AA_LOCAL%/*}" ] || mkdir -p "${GA_AA_LOCAL%/*}" || return 0
+		printf '%s\n%s\n%s\n' "$GA_AA_BEGIN" '/dev/vport[0-9]*p[0-9]* rw,' "$GA_AA_END" \
+			>> "$GA_AA_LOCAL" && ga_msg "let gpsd open virtio-console ports ($GA_AA_LOCAL)"
+	fi
+	ga_gnss_reload
+	return 0
+}
+
+ga_gnss_remove() {
+	if grep -qxF "$GA_AA_BEGIN" "$GA_AA_LOCAL" 2>/dev/null; then
+		sed -i "\|^$GA_AA_BEGIN\$|,\|^$GA_AA_END\$|d" "$GA_AA_LOCAL" || true
+	fi
+	ga_gnss_reload
+	return 0
+}
+
 ga_install() {
 	ga_add_render_groups
 	ga_fix_greeter_background
+	ga_gnss_install
 
 	# Idempotent: a reinstall or a failed previous attempt must not wedge the tree.
 	if dkms status -m "$PKG" -v "$VER" 2>/dev/null | grep -q .; then
@@ -282,6 +326,7 @@ ga_install() {
 }
 
 ga_remove() {
+	ga_gnss_remove
 	if dkms status -m "$PKG" -v "$VER" 2>/dev/null | grep -q .; then
 		ga_msg "removing dkms modules"
 		dkms remove -m "$PKG" -v "$VER" --all || ga_warn "dkms remove failed"

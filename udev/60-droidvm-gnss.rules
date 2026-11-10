@@ -1,0 +1,7 @@
+# DroidVM's GNSS receiver: the host's virtio-console port named org.droidvm.gnss.0, a serial line
+# streaming NMEA 0183 (one epoch a second; every system the phone tracks, or a location-only fix).
+# No driver of its own: virtio_console makes the port and gpsd reads it. Group dialout because
+# gpsd opens hotplugged devices after dropping to user gpsd; gpsdctl@ is gpsd's own hotplug unit
+# (it adds the device when /etc/default/gpsd has USBAUTO=true, the default).
+SUBSYSTEM=="virtio-ports", ATTR{name}=="org.droidvm.gnss.0", GROUP="dialout", MODE="0660", \
+    SYMLINK+="gnss-droidvm", TAG+="systemd", ENV{SYSTEMD_WANTS}+="gpsdctl@%k.service"
